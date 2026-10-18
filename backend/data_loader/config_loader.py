@@ -350,11 +350,20 @@ class AppConfig(BaseModel):
     occupations: list[Occupation]
     employees: list[Employee]
     reference_calculations: list[ReferenceCalculation]
+    car_aliases: dict[str, list[str]] = Field(default_factory=dict)  # car_id -> names
 
     @model_validator(mode="after")
     def _cross_validate(self) -> "AppConfig":
         groups = set(self.rules.group_order)
         car_ids = {c.car_id for c in self.cars}
+        seen: dict[str, str] = {c.model_name.casefold(): c.car_id for c in self.cars}
+        for car_id, aliases in self.car_aliases.items():
+            if car_id not in car_ids:
+                raise ValueError(f"car_aliases: {car_id} not in catalogue")
+            for a in aliases:
+                owner = seen.setdefault(a.strip().casefold(), car_id)
+                if owner != car_id:
+                    raise ValueError(f"car_aliases: {a!r} used for both {owner} and {car_id}")
         occ = {o.name: o for o in self.occupations}
         if len(car_ids) != len(self.cars):
             raise ValueError("duplicate car ids in catalogue")
@@ -396,6 +405,10 @@ class AppConfig(BaseModel):
                 return c
         return None
 
+    def car_names(self, car: Car) -> list[str]:
+        """Model name + configured aliases (Hebrew and alternative spellings)."""
+        return [car.model_name, *self.car_aliases.get(car.car_id, [])]
+
     def cars_in_group(self, group: str) -> list[Car]:
         return [c for c in self.cars if c.group == group]
 
@@ -433,8 +446,17 @@ def _resolve_current_car(emp: dict, cars: list[Car]) -> dict:
     raise ValueError(f"{emp['employee_id']}: cannot resolve current car {raw!r}")
 
 
+def load_car_aliases(path: Path = paths.CAR_ALIASES_JSON) -> dict[str, list[str]]:
+    """Optional file; missing file = no aliases."""
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return {k: [a.strip() for a in v] for k, v in json.load(f)["aliases"].items()}
+
+
 def load_config(rules_path: Path = paths.RULES_JSON,
-                xlsx_path: Path = paths.CHALLENGE_XLSX) -> AppConfig:
+                xlsx_path: Path = paths.CHALLENGE_XLSX,
+                aliases_path: Path = paths.CAR_ALIASES_JSON) -> AppConfig:
     rules = load_rules(rules_path)
     wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
     try:
@@ -446,7 +468,8 @@ def load_config(rules_path: Path = paths.RULES_JSON,
     finally:
         wb.close()
     return AppConfig(rules=rules, cars=cars, occupations=occupations,
-                     employees=employees, reference_calculations=calculations)
+                     employees=employees, reference_calculations=calculations,
+                     car_aliases=load_car_aliases(aliases_path))
 
 
 @lru_cache(maxsize=1)

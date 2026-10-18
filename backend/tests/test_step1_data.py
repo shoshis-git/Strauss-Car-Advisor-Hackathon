@@ -173,5 +173,5 @@ def test_unified_config_export(tmp_path):
     out = export_unified_config(CONFIG, tmp_path / "config.json")
     data = json.loads(out.read_text(encoding="utf-8"))
     assert set(data) == {"rules", "cars", "occupations", "employees",
-                         "reference_calculations"}
+                         "reference_calculations", "car_aliases"}
     assert len(data["cars"]) == 20 and len(data["occupations"]) == 14
