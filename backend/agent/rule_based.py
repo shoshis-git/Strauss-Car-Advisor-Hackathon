@@ -10,6 +10,7 @@ import re
 from typing import Any, Optional
 
 from ..data_loader.config_loader import AppConfig
+from .formatting import fmt_ils, format_comparison
 from .llm import REP_PREFIX, LLMStep, ToolCall, assistant_message
 from .state import FIELD_LABELS, ConversationState, next_phase_fields
 from .tools import WAIVER, find_cars_in_text, resolve_occupation
@@ -134,8 +135,7 @@ def _turn_results(messages: list[dict[str, Any]], start: int) -> dict[str, dict]
     return results
 
 
-def _fmt(x: float) -> str:
-    return f"{x:,.0f}" if float(x).is_integer() else f"{x:,}"
+_fmt = fmt_ils
 
 
 class RuleBasedLLM:
@@ -197,15 +197,7 @@ class RuleBasedLLM:
 
         calc = done.get("calculate_comparison")
         if calc and calc.get("ok"):
-            if calc["is_eligible"]:
-                parts.append(
-                    f"החישוב מוכן ({calc['current_label']} ← {calc['alternative_label']}):\n"
-                    f"נטו היום: {_fmt(calc['net_today'])} ₪\n"
-                    f"נטו בחלופה: {_fmt(calc['net_alt'])} ₪\n"
-                    f"הפרש: {calc['net_diff']:+,} ₪ בחודש\n"
-                    f"למה: {calc['explanation']}")
-            else:
-                parts.append(f"החלופה המבוקשת אינה אפשרית: {calc['reason']}")
+            parts.append(format_comparison(calc))
         elif state.missing_info:
             ask = [FIELD_LABELS[f] for f in next_phase_fields(state.missing_info)]
             parts.append("כדי להמשיך אשמח לדעת: " + ", ".join(ask) + ".")

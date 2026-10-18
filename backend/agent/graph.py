@@ -20,9 +20,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..data_loader.config_loader import AppConfig, get_config
+from .formatting import format_comparison
 from .llm import REP_PREFIX, LLMClient, make_llm
 from .prompts import build_system_prompt
-from .state import ConversationState, StateStore, compute_missing
+from .state import (ConversationState, CurrentSituation, EmployeeProfile, StateStore,
+                    TargetChoice, compute_missing)
 from .tools import TOOL_SPECS, execute_tool
 
 MAX_TOOL_ROUNDS = 8
@@ -99,6 +101,51 @@ class AdvisorAgent:
         state.waiting_for_rep, state.rep_question, state.rep_field = False, None, None
         state.missing_info = compute_missing(state, self.config)
         return self._run_turn(state)
+
+    def load_demo_employee(self, conversation_id: str, employee_id: str) -> AgentReply:
+        """Fill the state from a sample employee and compute their original question.
+
+        Deterministic (no LLM): profile and current car come from the sample sheet,
+        the requested alternative is parsed from the employee's own question."""
+        from .rule_based import extract_fields  # deterministic Hebrew parser
+
+        emp = self.config.employee(employee_id)  # KeyError if unknown
+        try:
+            state = self.store.load(conversation_id)
+        except KeyError:
+            state = ConversationState(conversation_id=conversation_id)
+        state.profile = EmployeeProfile(
+            eligibility_group=emp.group, occupation=emp.occupation,
+            base_salary=emp.base_salary, commissions_bonuses=emp.commissions + emp.bonus,
+            pension_pct=emp.pension_employee_pct, hishtalmut_pct=emp.study_fund_employee_pct,
+            credit_points=emp.credit_points, children_count=emp.children_under_23,
+        )
+        state.current = (
+            CurrentSituation(status="car", current_car_code=emp.current_car_id,
+                             current_participation=emp.current_participation)
+            if emp.current_car_id else
+            CurrentSituation(status="waiver", current_participation=0.0,
+                             current_maintenance=emp.current_maintenance))
+        state.target = TargetChoice()
+        state.last_comparison = None
+        state.waiting_for_rep, state.rep_question, state.rep_field = False, None, None
+
+        state.add_message("employee", emp.question)
+        target = {k: v for k, v in extract_fields(emp.question, state, self.config).items()
+                  if k in ("target_car", "target_action")}
+        called = []
+        for name, args in (("update_profile", target), ("calculate_comparison", {})):
+            result = execute_tool(name, args, state, self.config)
+            state.add_message("tool", json.dumps(result, ensure_ascii=False),
+                              tool_name=name, tool_input=args)
+            called.append(name)
+        if state.last_comparison:
+            reply = format_comparison(state.last_comparison)
+        else:
+            reply = "טענתי את פרטי העובד/ת. לא זיהיתי את החלופה המבוקשת - לאיזה רכב לעבור, או לוותר?"
+        state.add_message("assistant", reply)
+        self.store.save(state)
+        return AgentReply(reply, state, called)
 
     # ------------------------------------------------------------------ #
     def _run_turn(self, state: ConversationState) -> AgentReply:

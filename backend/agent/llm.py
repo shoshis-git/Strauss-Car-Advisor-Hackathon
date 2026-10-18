@@ -86,23 +86,42 @@ def to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def parse_completion(data: dict[str, Any]) -> LLMStep:
-    """Chat Completions response -> LLMStep."""
+    """Chat Completions response -> LLMStep.
+
+    The assistant message sent back on the next request keeps each tool call exactly
+    as the provider returned it (plus a generated id if it had none). Providers attach
+    opaque data there that they require back - e.g. Gemini 3 puts a mandatory
+    `extra_content.google.thought_signature` on function calls."""
     try:
         msg = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"unexpected completion payload: {str(data)[:300]}") from e
-    calls = []
+    calls, raw_calls = [], []
     for tc in msg.get("tool_calls") or []:
+        tc = {**tc, "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"}
         fn = tc.get("function", {})
         args = fn.get("arguments") or "{}"
         try:
             parsed = json.loads(args) if isinstance(args, str) else dict(args)
         except json.JSONDecodeError:
             parsed = {"_invalid_arguments": args}
-        calls.append(ToolCall(tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                              fn.get("name", ""), parsed))
+        calls.append(ToolCall(tc["id"], fn.get("name", ""), parsed))
+        raw_calls.append(tc)
     text = msg.get("content") or ""
-    return LLMStep(text, calls, assistant_message(text, calls))
+    echo: dict[str, Any] = {"role": "assistant", "content": text or None}
+    if raw_calls:
+        echo["tool_calls"] = raw_calls
+    if msg.get("extra_content"):
+        echo["extra_content"] = msg["extra_content"]
+    return LLMStep(text, calls, echo)
+
+
+class Secret(str):
+    """A string that never shows its value in repr() - so API keys stay out of
+    tracebacks, pytest failure output and logs, while still working as a header."""
+
+    def __repr__(self) -> str:
+        return "'***'"
 
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
@@ -129,7 +148,8 @@ class OpenAICompatibleLLM:
     def __init__(self, model: str, base_url: str, api_key: Optional[str] = None,
                  temperature: float = 0.0, max_tokens: int = 2048, timeout: float = 60.0,
                  transport: Transport = http_post_json):
-        self.model, self.base_url, self.api_key = model, base_url.rstrip("/"), api_key
+        self.model, self.base_url = model, base_url.rstrip("/")
+        self.api_key = Secret(api_key) if api_key else None
         self.temperature, self.max_tokens, self.timeout = temperature, max_tokens, timeout
         self.transport = transport
 
@@ -145,7 +165,7 @@ class OpenAICompatibleLLM:
         }
 
     def step(self, *, system, messages, tools, state) -> LLMStep:
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        headers = {"Authorization": Secret(f"Bearer {self.api_key}")} if self.api_key else {}
         data = self.transport(f"{self.base_url}/chat/completions", headers,
                               self.request_body(system, messages, tools), self.timeout)
         return parse_completion(data)
@@ -158,8 +178,8 @@ class LiteLLMClient:
                  base_url: Optional[str] = None, temperature: float = 0.0):
         import litellm  # optional dependency
         self._litellm = litellm
-        self.model, self.api_key, self.base_url, self.temperature = (
-            model, api_key, base_url, temperature)
+        self.model, self.base_url, self.temperature = model, base_url, temperature
+        self.api_key = Secret(api_key) if api_key else None
 
     def step(self, *, system, messages, tools, state) -> LLMStep:
         resp = self._litellm.completion(
