@@ -10,9 +10,9 @@ import re
 from typing import Any, Optional
 
 from ..data_loader.config_loader import AppConfig
-from .formatting import fmt_ils, format_comparison
+from .formatting import fmt_ils, format_blocked, format_comparison
 from .llm import REP_PREFIX, LLMStep, ToolCall, assistant_message
-from .state import FIELD_LABELS, ConversationState, next_phase_fields
+from .state import FIELD_LABELS, ConversationState, is_blocked, next_phase_fields
 from .tools import WAIVER, find_cars_in_text, resolve_occupation
 
 NUM = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
@@ -198,6 +198,8 @@ class RuleBasedLLM:
         calc = done.get("calculate_comparison")
         if calc and calc.get("ok"):
             parts.append(format_comparison(calc))
+        elif is_blocked(state):
+            parts.append(format_blocked(state.precheck))
         elif state.missing_info:
             ask = [FIELD_LABELS[f] for f in next_phase_fields(state.missing_info)]
             parts.append("כדי להמשיך אשמח לדעת: " + ", ".join(ask) + ".")

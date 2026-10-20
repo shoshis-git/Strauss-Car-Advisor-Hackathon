@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -42,6 +43,9 @@ class TargetChoice(BaseModel):
     target_participation: Optional[float] = None  # None = catalogue default
 
 
+ParticipationField = Literal["current_participation", "target_participation"]
+
+
 class Message(BaseModel):
     role: Literal["employee", "assistant", "representative", "tool"]
     content: str
@@ -52,6 +56,7 @@ class Message(BaseModel):
 
 class ConversationState(BaseModel):
     conversation_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    display_name: Optional[str] = None  # shown to the representative (e.g. demo employee)
     profile: EmployeeProfile = Field(default_factory=EmployeeProfile)
     current: CurrentSituation = Field(default_factory=CurrentSituation)
     target: TargetChoice = Field(default_factory=TargetChoice)
@@ -60,6 +65,15 @@ class ConversationState(BaseModel):
     rep_question: Optional[str] = None
     rep_field: Optional[str] = None  # state field the representative's answer fills
     last_comparison: Optional[dict[str, Any]] = None
+    # fail-fast eligibility of the requested alternative, checked as soon as the
+    # occupation/group and the request are known - before any salary questions
+    precheck: Optional[dict[str, Any]] = None
+    # the employee said they do not know this participation -> never the catalogue default,
+    # only a representative-approved value (cleared once the value is filled)
+    participation_unknown: Optional[ParticipationField] = None
+    # index of the first message of the current case: a new employee/scenario in the same
+    # chat starts here, and nothing before it is shown to the language model
+    case_start: int = 0
     messages: list[Message] = Field(default_factory=list)
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
@@ -71,6 +85,34 @@ class ConversationState(BaseModel):
 
     def tool_calls(self) -> list[Message]:
         return [m for m in self.messages if m.role == "tool"]
+
+    def reset_case(self) -> None:
+        """A new employee / scenario in the same chat: forget every fact of the previous
+        case (pay, cars, participations, results). The case starts at the latest employee
+        message, which belongs to the new case."""
+        self.display_name = None
+        self.profile, self.current, self.target = (EmployeeProfile(), CurrentSituation(),
+                                                   TargetChoice())
+        self.last_comparison = self.precheck = None
+        self.participation_unknown = None
+        self.case_start = max((i for i, m in enumerate(self.messages) if m.role == "employee"),
+                              default=len(self.messages))
+
+
+# "I have no idea what my participation is" - a value only a representative may set
+_PARTICIPATION_WORDS = r"(השתתפות|משלם|משלמת)"
+_UNKNOWN_WORDS = (r"(לא\s*(?:יודע|יודעת|ידוע|בטוח|בטוחה|זוכר|זוכרת)|אין\s*לי\s*(?:מושג|מידע)|"
+                  r"אינני\s*יודע|איני\s*יודע)")
+_TARGET_WORDS = r"(חדש|החדש|אעבור|לעבור|המבוקש|שאקח|אקח|לקחת|מיוחדת|חריגה)"
+
+
+def participation_unknown_field(text: str, state: "ConversationState") -> Optional[str]:
+    """Which participation the employee says they do not know (None = they did not)."""
+    if not (re.search(_PARTICIPATION_WORDS, text) and re.search(_UNKNOWN_WORDS, text)):
+        return None
+    if re.search(_TARGET_WORDS, text) or state.current.current_participation is not None:
+        return "target_participation"
+    return "current_participation"
 
 
 # --------------------------------------------------------------------------- #
@@ -89,17 +131,32 @@ FIELD_LABELS: dict[str, str] = {
     "target_action": "החלופה המבוקשת (רכב אחר או ויתור)",
     "target_car_code": "הרכב המבוקש",
     "children_count": "מספר הילדים עד גיל 23",
+    "target_participation": "ההשתתפות החודשית ברכב המבוקש (באישור נציג/ה)",
+    "allowed_alternative": "חלופה מותרת (הבקשה הנוכחית אינה אפשרית)",
 }
+# Two rounds at most: everything about pay in one message, then the cars.
 PHASES: list[list[str]] = [
-    ["base_salary", "eligibility_group"],
-    ["commissions_bonuses", "pension_pct", "hishtalmut_pct", "credit_points"],
-    ["current_car_code", "current_participation", "occupation",
-     "target_action", "target_car_code", "children_count"],
+    ["base_salary", "eligibility_group", "occupation", "commissions_bonuses",
+     "pension_pct", "hishtalmut_pct", "credit_points"],
+    ["current_car_code", "current_participation",
+     "target_action", "target_car_code", "children_count", "target_participation"],
 ]
 
 
-def compute_missing(state: ConversationState, config: AppConfig) -> list[str]:
-    """Fields still required before a comparison can be calculated."""
+def is_blocked(state: ConversationState) -> bool:
+    """The requested alternative is already known to be impossible (fail-fast)."""
+    return bool(state.precheck) and state.precheck.get("eligible") is False
+
+
+def compute_missing(state: ConversationState, config: AppConfig,
+                    ignore_block: bool = False) -> list[str]:
+    """Fields still required before a comparison can be calculated.
+
+    While the request is blocked, the only thing missing is a permitted alternative -
+    there is no point asking for salary details first (ignore_block=True gives the
+    underlying data gaps, e.g. to still compute today's net for an ineligible request)."""
+    if is_blocked(state) and not ignore_block:
+        return ["allowed_alternative"]
     p, cur, tgt = state.profile, state.current, state.target
     missing: list[str] = []
     for f in ("base_salary", "eligibility_group", "commissions_bonuses",
@@ -122,6 +179,10 @@ def compute_missing(state: ConversationState, config: AppConfig) -> list[str]:
         elif (tgt.target_car_code in config.rules.family_track.cars
               and p.children_count is None):
             missing.append("children_count")
+        # unknown to the employee -> a rep-approved value, never the catalogue default
+        if (state.participation_unknown == "target_participation"
+                and tgt.target_participation is None):
+            missing.append("target_participation")
     return missing
 
 

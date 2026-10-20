@@ -351,6 +351,7 @@ class AppConfig(BaseModel):
     employees: list[Employee]
     reference_calculations: list[ReferenceCalculation]
     car_aliases: dict[str, list[str]] = Field(default_factory=dict)  # car_id -> names
+    car_brand_words: list[str] = Field(default_factory=list)  # e.g. BYD, טויוטה
 
     @model_validator(mode="after")
     def _cross_validate(self) -> "AppConfig":
@@ -448,10 +449,17 @@ def _resolve_current_car(emp: dict, cars: list[Car]) -> dict:
 
 def load_car_aliases(path: Path = paths.CAR_ALIASES_JSON) -> dict[str, list[str]]:
     """Optional file; missing file = no aliases."""
+    return _load_car_names(path)[0]
+
+
+def _load_car_names(path: Path) -> tuple[dict[str, list[str]], list[str]]:
+    """(aliases per car id, brand words) from car_aliases.json; missing file = none."""
     if not path.exists():
-        return {}
+        return {}, []
     with open(path, encoding="utf-8") as f:
-        return {k: [a.strip() for a in v] for k, v in json.load(f)["aliases"].items()}
+        data = json.load(f)
+    aliases = {k: [a.strip() for a in v] for k, v in data["aliases"].items()}
+    return aliases, [b.strip() for b in data.get("brand_words", [])]
 
 
 def load_config(rules_path: Path = paths.RULES_JSON,
@@ -467,9 +475,10 @@ def load_config(rules_path: Path = paths.RULES_JSON,
         calculations = _read_sheet(wb, SHEET_CALCULATIONS, CALCULATION_COLUMNS)
     finally:
         wb.close()
+    aliases, brand_words = _load_car_names(aliases_path)
     return AppConfig(rules=rules, cars=cars, occupations=occupations,
                      employees=employees, reference_calculations=calculations,
-                     car_aliases=load_car_aliases(aliases_path))
+                     car_aliases=aliases, car_brand_words=brand_words)
 
 
 @lru_cache(maxsize=1)
