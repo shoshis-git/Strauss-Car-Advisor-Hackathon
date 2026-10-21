@@ -7,11 +7,21 @@ reaches the language model. Only values the employee then confirms enter the sta
 
 Trust: the model only points at values - every number it returns must literally appear
 in the payslip text (on the line it quotes), otherwise it is dropped. Sums (commission +
-bonus) are computed here, never by the model."""
+bonus) are computed here, never by the model.
+
+Fallback - the page image (vision model): a PDF without readable text (a scan, or a font
+that stores glyph codes instead of characters) is rendered to an image in memory and read
+by the same language model - only after the employee consented for that file, since an
+image cannot be redacted (PAYSLIP_VISION=off disables the option). There is no
+independent text to check against, so the model also
+transcribes the payment / deduction lines and the totals, and the code checks the
+payslip's own arithmetic (lines add up to the totals, payments - deductions = net)."""
 from __future__ import annotations
 
+import base64
 import io
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -23,11 +33,12 @@ from .state import FIELD_LABELS, ConversationState
 MAX_BYTES = 5 * 1024 * 1024
 MAX_PAGES = 4
 MIN_TEXT_CHARS = 40
+MIN_HEBREW_LETTERS = 20  # any real Israeli payslip has far more
 REDACTED = "[הושחר]"
 
 # fields a payslip can fill, with sane ranges (out of range = misread -> dropped)
 PAYSLIP_FIELDS: dict[str, tuple[float, float]] = {
-    "base_salary": (1_000, 300_000),
+    "base_salary": (1, 300_000),  # hourly / part-time payslips can be a few hundred ₪
     "commissions_bonuses": (0, 300_000),
     "pension_pct": (0, 30),
     "hishtalmut_pct": (0, 30),
@@ -42,6 +53,22 @@ class PayslipError(ValueError):
     def __init__(self, message: str, status: int = 422):
         super().__init__(message)
         self.status = status
+
+
+class PayslipUnreadable(PayslipError):
+    """A valid PDF without readable text (scan / glyph codes): only its image can be read."""
+
+
+VISION_ENV = "PAYSLIP_VISION"
+
+
+def vision_enabled(llm: LLMClient) -> bool:
+    """Reading payslip images with the language model: on unless PAYSLIP_VISION=off (and
+    never for the deterministic brain, which has no eyes)."""
+    from .rule_based import RuleBasedLLM
+
+    return (os.environ.get(VISION_ENV, "on").strip().lower() not in ("off", "0", "false")
+            and not isinstance(llm, RuleBasedLLM))
 
 
 # --------------------------------------------------------------------------- #
@@ -83,9 +110,31 @@ def read_pdf_text(data: bytes) -> str:
     except (PdfReadError, ValueError, KeyError, TypeError, OSError):
         raise PayslipError("לא הצלחתי לקרוא את הקובץ - נראה שהוא פגום") from None
     if len(re.findall(r"[\w]", text)) < MIN_TEXT_CHARS:
-        raise PayslipError("לא נמצא טקסט בקובץ - נראה שזה צילום או סריקה. יש להעלות את "
-                           "התלוש הדיגיטלי (PDF ממערכת השכר), או למסור את הנתונים בצ'אט.")
+        raise PayslipUnreadable("לא נמצא טקסט בקובץ - נראה שזה צילום או סריקה. "
+                                "אפשר למסור את הנתונים בצ'אט.")
+    if len(re.findall(r"[א-ת]", text)) < MIN_HEBREW_LETTERS:
+        # text exists but is not Hebrew: the PDF stores glyph codes without a character map
+        # (e.g. '#446$$' printed as 355.00) - nothing in it can be read or verified
+        raise PayslipUnreadable("לא הצלחתי לקרוא את הטקסט בתלוש: מערכת השכר שהפיקה אותו "
+                                "שומרת את האותיות והספרות בקידוד פנימי של הגופן, ולכן הטקסט "
+                                "בקובץ משובש. אפשר למסור את הנתונים בצ'אט.")
     return normalize_rtl(text)
+
+
+def render_pages(data: bytes, max_pages: int = 2, scale: float = 2.0) -> list[bytes]:
+    """PDF pages -> PNG images, in memory (about 144 dpi: small print stays legible)."""
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(data)
+    try:
+        images = []
+        for i in range(min(len(pdf), max_pages)):
+            buf = io.BytesIO()
+            pdf[i].render(scale=scale).to_pil().save(buf, format="PNG")
+            images.append(buf.getvalue())
+        return images
+    finally:
+        pdf.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -124,7 +173,8 @@ EXTRACT_TOOL = {
         "type": "object",
         "properties": {
             "occupation": {"type": "string", "description": "התפקיד / העיסוק כפי שכתוב בתלוש"},
-            "base_salary": {"type": "number", "description": "שכר בסיס חודשי"},
+            "base_salary": {"type": "number",
+                            "description": "שכר בסיס / שכר יסוד חודשי (סכום התשלום, לא התעריף)"},
             "commission_items": {
                 "type": "array", "items": {"type": "number"},
                 "description": "סכום כל שורת עמלות / בונוס / פרמיה בנפרד, כפי שכתוב (בלי לסכם)"},
@@ -185,7 +235,7 @@ def rule_based_extract(text: str) -> dict[str, Any]:
             continue
         employer = re.search(r"מעביד|מעסיק", line)
         checks = [
-            ("base_salary", re.search(r"שכר\s*(?:ה)?בסיס|משכורת\s*בסיס", line), False),
+            ("base_salary", re.search(r"שכר\s*(?:ה)?(?:בסיס|יסוד)|משכורת\s*בסיס", line), False),
             ("credit_points", re.search(r"נקודות\s*זיכוי|נק['׳]?\s*זיכוי", line), False),
             ("hishtalmut_pct", re.search(r"השתלמות", line) and not employer, True),
             ("pension_pct", re.search(r"פנסיה|גמל|תגמולי", line) and not employer, True),
@@ -235,14 +285,23 @@ class ExtractedField:
 
 
 @dataclass
+class Check:
+    ok: bool
+    text: str
+
+
+@dataclass
 class PayslipExtraction:
     fields: list[ExtractedField] = field(default_factory=list)
     not_found: list[str] = field(default_factory=list)   # labels
     rejected: list[str] = field(default_factory=list)    # human-readable reasons
+    source: str = "text"                                 # "text" | "image"
+    checks: list[Check] = field(default_factory=list)    # payslip arithmetic (image only)
 
     def as_dict(self) -> dict[str, Any]:
         return {"fields": [f.__dict__ for f in self.fields], "not_found": self.not_found,
-                "rejected": self.rejected}
+                "rejected": self.rejected, "source": self.source,
+                "checks": [c.__dict__ for c in self.checks]}
 
 
 def _numbers_in(s: str) -> set[float]:
@@ -327,6 +386,118 @@ def verify(raw: dict[str, Any], text: str, config: AppConfig) -> PayslipExtracti
     return res
 
 
-def extract_payslip(data: bytes, llm: LLMClient, config: AppConfig) -> PayslipExtraction:
-    text = redact(read_pdf_text(data))
+# --------------------------------------------------------------------------- #
+# 5. Fallback: the page image, read by the vision model
+# --------------------------------------------------------------------------- #
+_LINES = {"type": "array", "items": {
+    "type": "object", "properties": {"description": {"type": "string"},
+                                     "amount": {"type": "number"}},
+    "required": ["description", "amount"]}}
+
+VISION_TOOL = {
+    "name": EXTRACT_TOOL["name"],
+    "description": EXTRACT_TOOL["description"],
+    "input_schema": {"type": "object", "properties": {
+        **{k: v for k, v in EXTRACT_TOOL["input_schema"]["properties"].items()
+           if k != "evidence"},
+        "payment_lines": {**_LINES, "description": "כל שורות טבלת התשלומים: תיאור וסכום"},
+        "deduction_lines": {**_LINES, "description": "כל שורות הניכויים (חובה ורשות): תיאור וסכום"},
+        "other_lines": {"type": "array", "items": {"type": "string"},
+                        "description": "שורות נוספות שמהן נלקחו ערכים (נקודות זיכוי, אחוזי "
+                                       "הפרשה, תפקיד), מועתקות כלשונן"},
+        "total_payments": {"type": "number", "description": "סה\"כ תשלומים"},
+        "total_deductions": {"type": "number", "description": "סה\"כ ניכויים"},
+        "net_pay": {"type": "number", "description": "נטו לתשלום"},
+    }},
+}
+
+VISION_SYSTEM = """\
+אתה קורא תלושי שכר ישראליים מתמונה. הפעל את הכלי report_payslip_fields פעם אחת.
+- העתק מספרים בדיוק כפי שהם מודפסים. לעולם אל תחשב, אל תסכם ואל תעגל.
+- תעתק את כל שורות התשלומים ואת כל שורות הניכויים (תיאור + סכום), ואת סה"כ תשלומים,
+  סה"כ ניכויים ונטו לתשלום - הם משמשים לבדיקת הקריאה.
+- שכר בסיס: הסכום בשורת שכר בסיס/שכר יסוד (עמודת הסכום, לא התעריף או הכמות).
+- אחוזי הפרשה: רק חלק העובד, ורק אם האחוז מודפס. השתתפות ברכב: הניכוי, לא שווי השימוש.
+- אל תעתיק פרטים מזהים: שם, ת"ז, כתובת, טלפון, בנק, סניף, חשבון.
+- שדה שלא מופיע או לא קריא - השמט.
+"""
+
+ARITHMETIC_TOLERANCE = 1.0  # ₪ - payslips round each line
+
+
+def _amounts(raw: dict[str, Any], key: str) -> list[float]:
+    out = []
+    for line in raw.get(key) or []:
+        try:
+            out.append(float(line["amount"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
+
+
+def arithmetic_checks(raw: dict[str, Any]) -> list[Check]:
+    """The payslip checks itself: a misread digit breaks one of these sums."""
+    pay, ded = _amounts(raw, "payment_lines"), _amounts(raw, "deduction_lines")
+    totals = {k: raw.get(k) for k in ("total_payments", "total_deductions", "net_pay")}
+    checks = []
+
+    def add(ok: bool, text: str) -> None:
+        checks.append(Check(ok, text))
+
+    near = lambda a, b: abs(a - b) <= ARITHMETIC_TOLERANCE  # noqa: E731
+    if pay and totals["total_payments"] is not None:
+        s, t = round(sum(pay), 2), float(totals["total_payments"])
+        add(near(s, t), f"סכום שורות התשלומים {s:,.2f} {'=' if near(s, t) else '≠'} "
+                        f"סה\"כ תשלומים {t:,.2f}")
+    if ded and totals["total_deductions"] is not None:
+        s, t = round(sum(ded), 2), float(totals["total_deductions"])
+        add(near(s, t), f"סכום שורות הניכויים {s:,.2f} {'=' if near(s, t) else '≠'} "
+                        f"סה\"כ ניכויים {t:,.2f}")
+    if None not in totals.values():
+        p, d, n = (float(totals[k]) for k in ("total_payments", "total_deductions", "net_pay"))
+        add(near(p - d, n), f"תשלומים {p:,.2f} פחות ניכויים {d:,.2f} "
+                            f"{'=' if near(p - d, n) else '≠'} נטו {n:,.2f}")
+    if not checks:
+        add(False, "לא נמצאו בתלוש סכומים לבדיקת הקריאה")
+    return checks
+
+
+def vision_transcript(raw: dict[str, Any]) -> str:
+    """The model's own transcription, as payslip-like text lines (then redacted, verified)."""
+    lines = [f"{ln.get('description', '')} {ln.get('amount', '')}"
+             for key in ("payment_lines", "deduction_lines") for ln in raw.get(key) or []
+             if isinstance(ln, dict)]
+    lines += [str(s) for s in raw.get("other_lines") or []]
+    return "\n".join(lines)
+
+
+def vision_extract(data: bytes, llm: LLMClient) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": "תמונת תלוש השכר:"}]
+    content += [{"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}
+                for png in render_pages(data)]
+    step = llm.step(system=VISION_SYSTEM, tools=[VISION_TOOL], state=ConversationState(),
+                    messages=[{"role": "user", "content": content}])
+    call = next((c for c in step.tool_calls if c.name == VISION_TOOL["name"]), None)
+    return call.input if call is not None else {}
+
+
+def extract_from_image(data: bytes, llm: LLMClient, config: AppConfig) -> PayslipExtraction:
+    raw = vision_extract(data, llm)
+    text = redact(vision_transcript(raw))  # identifiers never reach the browser either
+    res = verify({k: v for k, v in raw.items() if k != "evidence"}, text, config)
+    res.source, res.checks = "image", arithmetic_checks(raw)
+    return res
+
+
+def extract_payslip(data: bytes, llm: LLMClient, config: AppConfig,
+                    image_consent: bool = False) -> PayslipExtraction:
+    """image_consent: the employee agreed to send this file's page image to the model
+    (asked only after the text proved unreadable - an image cannot be redacted)."""
+    try:
+        text = redact(read_pdf_text(data))
+    except PayslipUnreadable:
+        if not (image_consent and vision_enabled(llm)):
+            raise
+        return extract_from_image(data, llm, config)
     return verify(llm_extract(text, llm), text, config)

@@ -129,6 +129,15 @@ export interface PayslipExtraction {
   fields: PayslipField[];
   not_found: string[];
   rejected: string[];
+  /** text = read from the PDF text and verified against it; image = read from the page
+   *  image by the vision model (no independent text - see checks) */
+  source: "text" | "image" | null;
+  /** the payslip's own arithmetic, checked in code (image only) */
+  checks: { ok: boolean; text: string }[];
+  /** no readable text in the PDF - why; the employee may then agree to send its image */
+  unreadable?: string | null;
+  /** the server can read payslip images (PAYSLIP_VISION and an image-capable model) */
+  vision_available?: boolean;
 }
 
 export type PayslipValues = Partial<Record<PayslipFieldName, number | string>>;
@@ -280,8 +289,9 @@ export const api = {
   setAlternative: (id: string, choice: { car_id: string } | { waiver: true }) =>
     post<ChatResponse>(`/api/session/${id}/alternative`, choice),
   /** the PDF itself is the body; the server reads it in memory and keeps nothing */
-  extractPayslip: async (file: Blob) =>
-    request<PayslipExtraction>("/api/payslip/extract", {
+  /** imageConsent: the employee agreed to send the page image to the model (unreadable PDF) */
+  extractPayslip: async (file: Blob, imageConsent = false) =>
+    request<PayslipExtraction>(`/api/payslip/extract${imageConsent ? "?vision=1" : ""}`, {
       method: "POST",
       body: await readBytes(file), // raw bytes: portable across fetch implementations
       headers: { "Content-Type": "application/pdf" },

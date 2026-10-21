@@ -12,8 +12,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.agent.llm import LLMStep, ToolCall, assistant_message
-from backend.agent.payslip import (MAX_BYTES, PayslipError, extract_payslip, llm_extract,
-                                   read_pdf_text, redact, rule_based_extract, verify)
+from backend.agent.payslip import (MAX_BYTES, PayslipError, PayslipUnreadable,
+                                   extract_payslip, llm_extract, read_pdf_text, redact,
+                                   render_pages, rule_based_extract, verify)
 from backend.agent.rule_based import RuleBasedLLM
 from backend.data_loader.config_loader import get_config
 from backend.main import create_app
@@ -68,6 +69,18 @@ def test_bad_files_are_rejected_with_a_reason(data, status, words):
     with pytest.raises(PayslipError) as e:
         read_pdf_text(data)
     assert e.value.status == status and words in str(e.value)
+
+
+def test_glyph_code_text_layer_is_reported_as_unreadable():
+    """A real payroll PDF (ט.מ.ל) stored glyph codes, not characters: say so honestly."""
+    data = (FIXTURES / "payslip_glyph_codes.pdf").read_bytes()
+    with pytest.raises(PayslipError, match="קידוד פנימי של הגופן") as e:
+        read_pdf_text(data)
+    assert e.value.status == 422
+
+
+def test_base_salary_synonym():
+    assert rule_based_extract("355.00 45.00 7.88 שכר יסוד")["base_salary"] == 355
 
 
 def test_password_protected_pdf_is_rejected():
@@ -154,8 +167,8 @@ def test_model_cannot_sum_commissions_itself():
 
 
 def test_out_of_range_and_unknown_occupation_are_rejected():
-    text = "שכר בסיס 500\nתפקיד: אסטרונאוט\nנקודות זיכוי 2.25"
-    ex = verify({"base_salary": 500, "occupation": "אסטרונאוט", "credit_points": 2.25},
+    text = "שכר בסיס 500000\nתפקיד: אסטרונאוט\nנקודות זיכוי 2.25"
+    ex = verify({"base_salary": 500000, "occupation": "אסטרונאוט", "credit_points": 2.25},
                 text, CONFIG)
     assert values(ex) == {"credit_points": 2.25}
     assert any("לא סביר" in r for r in ex.rejected)
@@ -177,6 +190,101 @@ def test_llm_answer_without_tool_call_is_parsed_or_ignored():
 def test_rule_based_extractor_reads_percent_next_to_its_sign():
     out = rule_based_extract("1,140.00 %6.00 קופת גמל - חלק עובד")
     assert out["pension_pct"] == 6.0
+
+
+# --------------------------------------------------------------------------- #
+# Fallback: page image -> vision model (scan / glyph-code fonts)
+# --------------------------------------------------------------------------- #
+GLYPH_PDF = (FIXTURES / "payslip_glyph_codes.pdf").read_bytes()
+# what a vision model reads off a payslip like the real ט.מ.ל one (355 / 4 + 11 / 340)
+VISION_ANSWER = {
+    "base_salary": 355, "credit_points": 2.75,
+    "payment_lines": [{"description": "שכר יסוד", "amount": 355}],
+    "deduction_lines": [{"description": "ביטוח לאומי", "amount": 4},
+                        {"description": "דמי בריאות", "amount": 11}],
+    "other_lines": ["נ. זיכוי: 2.75"],
+    "total_payments": 355, "total_deductions": 15, "net_pay": 340,
+}
+
+
+class VisionLLM(CapturingLLM):
+    def step(self, *, system, messages, tools, state):
+        self.sent.append(messages[0]["content"])  # the multimodal content parts
+        call = ToolCall("v1", tools[0]["name"], self.args)
+        return LLMStep("", [call], assistant_message("", [call]))
+
+
+def test_render_pages_gives_png_images():
+    pages = render_pages(E004_PDF)
+    assert len(pages) == 1 and pages[0].startswith(b"\x89PNG")
+
+
+def test_unreadable_pdf_is_read_from_its_image(monkeypatch):
+    monkeypatch.delenv("PAYSLIP_VISION", raising=False)  # on by default
+    llm = VisionLLM(VISION_ANSWER)
+    ex = extract_payslip(GLYPH_PDF, llm, CONFIG, image_consent=True)
+    assert ex.source == "image"
+    assert values(ex) == {"base_salary": 355, "credit_points": 2.75}
+    assert [c.ok for c in ex.checks] == [True, True, True]
+    assert "355.00 פחות ניכויים 15.00 = נטו 340.00" in ex.checks[2].text
+    parts = llm.sent[0]
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_no_image_leaves_without_the_employees_consent(monkeypatch):
+    monkeypatch.delenv("PAYSLIP_VISION", raising=False)
+    llm = VisionLLM(VISION_ANSWER)
+    with pytest.raises(PayslipUnreadable):
+        extract_payslip(GLYPH_PDF, llm, CONFIG)  # no consent given
+    assert llm.sent == []  # the model was not called at all
+
+
+def test_digital_pdf_never_goes_to_the_image_path():
+    llm = VisionLLM(VISION_ANSWER)
+    ex = extract_payslip(E004_PDF, llm, CONFIG, image_consent=True)  # consent changes nothing
+    assert ex.source == "text"
+    assert isinstance(llm.sent[0], str)  # text only, no image was sent
+
+
+def test_a_misread_digit_breaks_the_payslip_arithmetic():
+    misread = {**VISION_ANSWER, "payment_lines": [{"description": "שכר יסוד", "amount": 385}],
+               "base_salary": 385}
+    ex = extract_payslip(GLYPH_PDF, VisionLLM(misread), CONFIG, image_consent=True)
+    assert [c.ok for c in ex.checks] == [False, True, True]
+    assert "≠" in ex.checks[0].text
+    assert values(ex)["base_salary"] == 385  # shown - the failed check flags it for review
+
+
+def test_image_values_must_appear_in_the_models_own_transcription():
+    ex = extract_payslip(GLYPH_PDF, VisionLLM({**VISION_ANSWER, "base_salary": 3550}), CONFIG,
+                         image_consent=True)
+    assert "base_salary" not in values(ex)
+    assert any("3550" in r for r in ex.rejected)
+
+
+def test_identifiers_transcribed_from_the_image_are_masked():
+    leaky = {**VISION_ANSWER, "other_lines": ["ת.ז 123456782", "נ. זיכוי: 2.75",
+                                              "חשבון 7654321"]}
+    out = str(extract_payslip(GLYPH_PDF, VisionLLM(leaky), CONFIG, image_consent=True).as_dict())
+    assert "123456782" not in out and "7654321" not in out
+
+
+def test_missing_totals_are_reported_not_assumed():
+    bare = {"base_salary": 355, "payment_lines": [{"description": "שכר יסוד", "amount": 355}]}
+    ex = extract_payslip(GLYPH_PDF, VisionLLM(bare), CONFIG, image_consent=True)
+    assert [c.ok for c in ex.checks] == [False]
+
+
+def test_vision_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("PAYSLIP_VISION", "off")
+    with pytest.raises(PayslipUnreadable):
+        extract_payslip(GLYPH_PDF, VisionLLM(VISION_ANSWER), CONFIG, image_consent=True)
+
+
+def test_deterministic_brain_has_no_vision():
+    with pytest.raises(PayslipUnreadable):
+        extract_payslip(SCANNED_PDF, RuleBasedLLM(CONFIG), CONFIG, image_consent=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -204,8 +312,7 @@ def test_extract_endpoint_returns_proposals_and_stores_nothing(client):
 @pytest.mark.parametrize("content, headers, status", [
     (E004_PDF, {"Content-Type": "image/png"}, 415),
     (b"%PDF-" + b"0" * MAX_BYTES, PDF, 413),
-    (SCANNED_PDF, PDF, 422),
-], ids=["png", "too-big", "scanned"])
+], ids=["png", "too-big"])
 def test_extract_endpoint_rejects_bad_uploads(client, content, headers, status):
     r = client.post("/api/payslip/extract", content=content, headers=headers)
     assert r.status_code == status and r.json()["detail"]
@@ -248,6 +355,43 @@ def test_employee_corrections_win_over_the_payslip(client):
 ])
 def test_apply_validation(client, body):
     assert client.post("/api/payslip/apply", json=body).status_code == 422
+
+
+def test_unreadable_pdf_asks_the_employee_before_any_image_is_sent(tmp_path, monkeypatch):
+    monkeypatch.delenv("PAYSLIP_VISION", raising=False)
+    llm = VisionLLM(VISION_ANSWER)
+    with TestClient(create_app(db_path=tmp_path / "v.db", llm=llm)) as c:
+        first = c.post("/api/payslip/extract", content=GLYPH_PDF, headers=PDF)
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert "קידוד פנימי של הגופן" in body["unreadable"] and body["vision_available"]
+        assert body["fields"] == [] and body["source"] is None
+        assert llm.sent == []  # nothing went to the model yet
+
+        # the employee agreed: the browser sends the same file again with ?vision=1
+        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers=PDF)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["source"] == "image" and body["unreadable"] is None
+    assert all(ch["ok"] for ch in body["checks"])
+    assert {f["field"]: f["value"] for f in body["fields"]} == {"base_salary": 355,
+                                                                 "credit_points": 2.75}
+
+
+def test_unreadable_pdf_without_vision_offers_only_the_chat(client):
+    body = client.post("/api/payslip/extract", content=SCANNED_PDF, headers=PDF).json()
+    assert "סריקה" in body["unreadable"] and body["vision_available"] is False
+
+
+def test_image_reading_refused_when_switched_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAYSLIP_VISION", "off")
+    llm = VisionLLM(VISION_ANSWER)
+    with TestClient(create_app(db_path=tmp_path / "v.db", llm=llm)) as c:
+        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers=PDF)
+        assert r.status_code == 403 and "PAYSLIP_VISION" in r.json()["detail"]
+        body = c.post("/api/payslip/extract", content=GLYPH_PDF, headers=PDF).json()
+        assert body["vision_available"] is False
+    assert llm.sent == []
 
 
 def test_apply_to_unknown_or_frozen_session(client):

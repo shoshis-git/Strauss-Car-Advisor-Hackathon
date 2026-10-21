@@ -180,8 +180,20 @@ def test_llm_check_endpoint_reports_cause(db_path):
                                rep_token=REP_KEY)) as c:
         assert c.get("/api/llm/check").status_code == 401  # paid call: rep key only
         r = c.get("/api/llm/check", headers=REP).json()
-    assert r["ok"] is False and r["provider_status"] == 429 and "מכסת" in r["message"]
-    assert r["model"] == "gemini-3.8-flash" and "api_key" not in r and "base_url" not in r
+    assert r["ok"] is False and r["model"] == "gemini-3.8-flash"
+    [p] = r["providers"]
+    assert p["provider_status"] == 429 and "מכסת" in p["message"]
+    assert "api_key" not in str(r) and "base_url" not in str(r)
+
+
+def test_llm_check_endpoint_checks_every_provider_in_the_chain(db_path):
+    from backend.agent.llm import FailoverLLM
+    chain = FailoverLLM([FailingProviderLLM(429), RuleBasedLLM(CONFIG)])
+    with TestClient(create_app(db_path=db_path, llm=chain, rep_token=REP_KEY)) as c:
+        r = c.get("/api/llm/check", headers=REP).json()
+    assert r["ok"] is True  # the backup works
+    assert [p["ok"] for p in r["providers"]] == [False, True]
+    assert r["providers"][0]["provider_status"] == 429
 
 
 def test_opt_in_fallback_answers_deterministically(db_path, monkeypatch):

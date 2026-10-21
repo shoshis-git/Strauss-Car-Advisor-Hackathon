@@ -12,7 +12,7 @@ from fastapi.security import APIKeyHeader
 
 from ..agent.graph import AdvisorAgent, AgentReply
 from ..agent.payslip import MAX_BYTES as PAYSLIP_MAX_BYTES
-from ..agent.payslip import PayslipError, extract_payslip
+from ..agent.payslip import PayslipError, PayslipUnreadable, extract_payslip, vision_enabled
 from ..agent.state import ConversationState
 from ..data_loader.config_loader import AppConfig
 from ..engine.eligibility import tax_value_of_use
@@ -120,21 +120,22 @@ def health(request: Request) -> dict[str, Any]:
 
 @rep_router.get("/llm/check")
 def llm_check(request: Request) -> dict[str, Any]:
-    """Diagnose the configured language model with one real (paid) request - rep key
-    required. The API key itself is never shown, not even masked."""
-    from ..agent.llm import LLMError
-    from ..agent.state import ConversationState
-    from ..agent.tools import TOOL_SPECS
+    """Diagnose the running language model(s) - one real (paid) request to each provider
+    in the chain (LLM_PROVIDER, LLM_PROVIDER_2, ...). Rep key required. API keys are never
+    shown, not even masked."""
+    from ..agent.llm_check import probe_client
 
     llm = _agent(request).llm
-    info: dict[str, Any] = {"llm": type(llm).__name__, "model": getattr(llm, "model", None)}
-    try:
-        step = llm.step(system="ענה במילה אחת.", tools=TOOL_SPECS, state=ConversationState(),
-                        messages=[{"role": "user", "content": "שלום"}])
-    except LLMError as e:
-        return {**info, "ok": False, "provider_status": e.status, "message": e.user_message}
-    return {**info, "ok": True, "reply_preview": step.text[:120],
-            "tool_calls": [c.name for c in step.tool_calls]}
+    providers = []
+    for client in getattr(llm, "clients", [llm]):
+        r = probe_client(client)
+        providers.append({"provider": getattr(client, "label", type(client).__name__),
+                          "ok": r["ok"], "seconds": r["seconds"],
+                          **({"tool_calls": r["tool_calls"], "reply_preview": r["text"][:120]}
+                             if r["ok"] else
+                             {"provider_status": r["status"], "message": r["message"]})})
+    return {"llm": type(llm).__name__, "model": getattr(llm, "model", None),
+            "ok": any(p["ok"] for p in providers), "providers": providers}
 
 
 @router.get("/catalog")
@@ -235,10 +236,17 @@ _TOO_BIG = f"הקובץ גדול מדי (מעל {PAYSLIP_MAX_BYTES // (1024 * 10
     "requestBody": {"required": True,
                     "content": {"application/pdf": {"schema": {"type": "string",
                                                                 "format": "binary"}}}}})
-async def payslip_extract(request: Request) -> dict[str, Any]:
+async def payslip_extract(request: Request, vision: bool = False) -> dict[str, Any]:
     """Body: the payslip PDF itself (Content-Type: application/pdf). The file is read in
     memory and discarded; identifying details are masked before the language model sees
-    the text. Returns proposed values with the payslip line each came from."""
+    the text. Returns proposed values with the payslip line each came from.
+
+    A PDF without readable text (scan, glyph-code fonts) comes back as `unreadable`; the
+    page image is sent to the vision model only when the request repeats the upload with
+    `?vision=1`, i.e. after the employee consented (an image cannot be redacted)."""
+    llm = _agent(request).llm
+    if vision and not vision_enabled(llm):
+        raise HTTPException(403, "קריאת תלושים מתמונה כבויה בשרת (PAYSLIP_VISION)")
     if request.headers.get("content-type", "").split(";")[0].strip() != "application/pdf":
         raise HTTPException(415, "אפשר להעלות רק תלוש שכר בפורמט PDF")
     if int(request.headers.get("content-length") or 0) > PAYSLIP_MAX_BYTES:
@@ -249,8 +257,11 @@ async def payslip_extract(request: Request) -> dict[str, Any]:
         if len(data) > PAYSLIP_MAX_BYTES:  # a lying / missing Content-Length
             raise HTTPException(413, _TOO_BIG)
     try:
-        res = await run_in_threadpool(extract_payslip, bytes(data), _agent(request).llm,
-                                      _config(request))
+        res = await run_in_threadpool(extract_payslip, bytes(data), llm, _config(request),
+                                      vision)
+    except PayslipUnreadable as e:  # a decision for the employee, not an error
+        return {"fields": [], "not_found": [], "rejected": [], "source": None, "checks": [],
+                "unreadable": str(e), "vision_available": vision_enabled(llm)}
     except PayslipError as e:
         raise HTTPException(e.status, str(e)) from None
     return res.as_dict()
