@@ -745,6 +745,52 @@ def test_conversation_continues_on_the_backup(store):
     assert primary.calls == 1  # benched after the first failure
 
 
+@pytest.mark.parametrize("var, value", [
+    ("LLM_API_KEY_3", "<המפתח מ-OpenRouter>"),     # copied from an example
+    ("LLM_MODEL_3", "<שם מודל מ-OpenRouter>"),
+    ("LLM_API_KEY_3", "sk-or-ab cd"),               # a space inside a key
+    ("GROQ_API_KEY", "מפתח"),                       # the provider's own variable
+])
+def test_placeholder_values_stop_at_startup_naming_the_variable(var, value):
+    with pytest.raises(LLMError, match=f"{var} looks like placeholder"):
+        make_llm(CONFIG, env={**THREE_PROVIDERS, var: value})
+
+
+def test_a_send_failure_is_a_provider_error_not_a_crash():
+    """The real incident: a Hebrew placeholder key cannot go into an HTTP header. It must
+    become an LLMError (so the next provider answers), and must not quote the key."""
+    from backend.agent.llm import http_post_json
+    with pytest.raises(LLMError) as e:
+        http_post_json("https://example.invalid/v1/chat/completions",
+                       {"Authorization": "Bearer <המפתח-הסודי>"}, {}, 1)
+    assert e.value.status is None and e.value.detail == "UnicodeEncodeError"
+    assert "המפתח-הסודי" not in str(e.value)
+
+
+def test_provider_detail_is_short_and_masks_tokens():
+    from backend.agent.llm import provider_detail
+    body = ('{"error":{"message":"The model `llama-3.1-70b-versatile` has been decommissioned",'
+            '"type":"invalid_request_error"}}')
+    assert provider_detail(body) == "The model `llama-3.1-70b-versatile` has been decommissioned"
+    leaked = '{"error":{"message":"Incorrect API key: gsk_abcdefghijklmnopqrstuvwxyz0123"}}'
+    assert "abcdefghijklmnop" not in provider_detail(leaked)
+    assert provider_detail("<html>blocked</html>") == "<html>blocked</html>"
+    assert provider_detail('[{"error":{"message":"quota"}}]') == "quota"  # Gemini's list form
+
+
+def test_failover_log_says_why(caplog):
+    class Decommissioned:
+        label = "groq:old"
+
+        def step(self, **kw):
+            raise LLMError("x", status=404, detail="model has been decommissioned")
+
+    llm = FailoverLLM([Decommissioned(), FlakyLLM("b")], cooldown_s=600, clock=Clock())
+    with caplog.at_level("WARNING", logger="strauss.llm"):
+        assert _ask(llm) == "b"
+    assert "groq:old failed (status 404: model has been decommissioned)" in caplog.text
+
+
 GEMINI_CALL = {"id": "c1", "type": "function",
                "function": {"name": "update_profile", "arguments": "{}"},
                "extra_content": {"google": {"thought_signature": "sig-from-gemini"}}}

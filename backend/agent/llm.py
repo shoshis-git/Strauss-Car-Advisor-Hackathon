@@ -20,9 +20,11 @@ what the automated tests use.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -56,11 +58,13 @@ TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
 class LLMError(RuntimeError):
-    """status: HTTP status from the provider; None = unreachable / malformed reply."""
+    """status: HTTP status from the provider; None = unreachable / malformed reply.
+    detail: the provider's own short explanation (safe to log - long tokens masked)."""
 
-    def __init__(self, message: str, status: Optional[int] = None):
+    def __init__(self, message: str, status: Optional[int] = None, detail: str = ""):
         super().__init__(message)
         self.status = status
+        self.detail = detail
 
     @property
     def transient(self) -> bool:
@@ -169,6 +173,23 @@ class Secret(str):
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
 
 
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-]{24,}")  # keys / tokens a provider might echo
+
+
+def provider_detail(body: str) -> str:
+    """The provider's own error message (JSON error.message if present), short and with
+    anything key-like masked - so it can go to the server log."""
+    text = body
+    try:
+        err = json.loads(body)
+        err = err[0] if isinstance(err, list) and err else err
+        msg = err.get("error", {}) if isinstance(err, dict) else {}
+        text = (msg.get("message") if isinstance(msg, dict) else msg) or body
+    except (ValueError, AttributeError):
+        pass
+    return _LONG_TOKEN.sub("…", " ".join(str(text).split()))[:200]
+
+
 def http_post_json(url: str, headers: dict[str, str], body: dict[str, Any],
                    timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
@@ -178,12 +199,20 @@ def http_post_json(url: str, headers: dict[str, str], body: dict[str, Any],
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")[:500]
-        raise LLMError(f"LLM HTTP {e.code} from {url}: {detail}", status=e.code) from e
+        raw = e.read().decode("utf-8", "replace")[:2000]
+        raise LLMError(f"LLM HTTP {e.code} from {url}: {raw[:500]}", status=e.code,
+                       detail=provider_detail(raw)) from e
     except urllib.error.URLError as e:
-        raise LLMError(f"LLM endpoint unreachable ({url}): {e.reason}") from e
+        raise LLMError(f"LLM endpoint unreachable ({url}): {e.reason}",
+                       detail=str(e.reason)[:200]) from e
     except TimeoutError as e:
-        raise LLMError(f"LLM endpoint timed out ({url})", status=408) from e
+        raise LLMError(f"LLM endpoint timed out ({url})", status=408, detail="timeout") from e
+    except (UnicodeError, ValueError, OSError, http.client.HTTPException) as e:
+        # e.g. a non-Latin character in the API key header, or a reply that is not JSON:
+        # a provider failure like any other (the next provider is tried, no 500). The
+        # exception text is not kept - it could quote the header value.
+        raise LLMError(f"LLM request to {url} failed: {type(e).__name__}",
+                       detail=type(e).__name__) from None
 
 
 # Documented by Google for function calls that Gemini did not produce itself (e.g. a turn
@@ -328,8 +357,8 @@ class FailoverLLM:
                 last = e
                 if e.status not in NO_COOLDOWN_STATUSES:
                     self._down_until[i] = self._clock() + self.cooldown_s
-                log.warning("LLM %s failed (status %s)%s - trying the next provider",
-                            getattr(client, "label", i), e.status,
+                log.warning("LLM %s failed (status %s: %s)%s - trying the next provider",
+                            getattr(client, "label", i), e.status, e.detail or "-",
                             "" if e.status in NO_COOLDOWN_STATUSES
                             else f", cooling down {self.cooldown_s:.0f}s")
                 continue
@@ -380,9 +409,19 @@ def configured_slots(env: dict[str, str]) -> list[int]:
             if (env.get(f"LLM_PROVIDER{slot_suffix(n)}") or "").strip()]
 
 
+def _check_value(name: str, value: Optional[str]) -> None:
+    """A value copied from an example ('<API key from OpenRouter>') instead of a real one:
+    stop at startup with the variable's name, not with a crash on the first request."""
+    if value and ("<" in value or ">" in value or not value.isascii() or " " in value.strip()):
+        raise LLMError(f"{name} looks like placeholder text, not a real value - "
+                       "replace it in .env (or delete the line)")
+
+
 def make_slot_client(env: dict[str, str], n: int) -> Any:
     """One provider slot -> its client (errors name the slot's own variables)."""
     s = slot_suffix(n)
+    for var in ("LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL"):
+        _check_value(var + s, env.get(var + s))
     provider = (env.get(f"LLM_PROVIDER{s}") or "").strip().lower()
     if provider == RULES:
         raise LLMError(f"LLM_PROVIDER{s}=rules is not a backup model - the deterministic "
@@ -401,6 +440,8 @@ def make_slot_client(env: dict[str, str], n: int) -> Any:
     if not base_url:
         raise LLMError(f"LLM_BASE_URL{s} must be set for LLM_PROVIDER{s}={provider}")
     api_key = env.get(f"LLM_API_KEY{s}") or (env.get(key_var) if key_var else None)
+    if key_var and not env.get(f"LLM_API_KEY{s}"):
+        _check_value(key_var, api_key)
     if key_var and not api_key:
         raise LLMError(f"LLM_API_KEY{s} (or {key_var}) must be set for LLM_PROVIDER{s}={provider}")
     return OpenAICompatibleLLM(model, base_url, api_key, provider=provider)
