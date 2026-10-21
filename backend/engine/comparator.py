@@ -1,7 +1,7 @@
 """Compare an employee's current situation with a requested alternative."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
@@ -83,7 +83,9 @@ def compare(
     employee: Employee | str,
     request: AlternativeRequest,
     value_of_use: ValueOfUseLookup = tax_value_of_use,
+    target_participation: Optional[float] = None,
 ) -> Comparison:
+    """target_participation overrides the catalogue default (e.g. approved by a rep)."""
     if isinstance(employee, str):
         employee = config.employee(employee)
     rules = config.rules
@@ -108,17 +110,20 @@ def compare(
         label = request.car_id if request.kind == "car" else "ויתור"
         return Comparison(alternative_label=label or "", **common)
 
-    alt = calculate_scenario(employee, elig.scenario, rules)
+    alt_sc = elig.scenario
+    if target_participation is not None and alt_sc.kind == "car":
+        alt_sc = replace(alt_sc, participation=target_participation)
+    alt = calculate_scenario(employee, alt_sc, rules)
     net_alt = r(alt.payslip.net)
     return Comparison(
-        alternative_label=elig.scenario.label,
+        alternative_label=alt_sc.label,
         net_alt=net_alt,
         net_diff=net_alt - common["net_today"],
         tax_alt=r(alt.payslip.income_tax),
         btl_health_alt=r(alt.payslip.btl_and_health),
         electric_gross=r(alt.electric_gross),
-        family_gap_deduction=r(elig.scenario.family_gap_deduction),
-        explanation=explain(today_sc, elig.scenario, rules),
+        family_gap_deduction=r(alt_sc.family_gap_deduction),
+        explanation=explain(today_sc, alt_sc, rules),
         alternative=alt,
         **common,
     )
