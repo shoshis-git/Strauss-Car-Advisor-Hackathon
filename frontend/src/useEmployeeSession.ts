@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, type Message, type StateView } from "./api";
+import {
+  api,
+  ApiError,
+  type Message,
+  type PayslipExtraction,
+  type PayslipValues,
+  type StateView,
+} from "./api";
 
 const STORAGE_KEY = "car-advisor.session";
 const POLL_MS = 3000;
-
-export interface LocalNote extends Message {
-  local: true;
-}
-export type ChatItem = Message | LocalNote;
 
 function readStored(): string | null {
   try {
@@ -25,15 +27,20 @@ function writeStored(id: string | null) {
   }
 }
 
+function isPdf(file: File): boolean {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
 /** Employee conversation: server is the source of truth, refreshed after every action. */
 export function useEmployeeSession() {
   const [sessionId, setSessionId] = useState<string | null>(readStored);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [notes, setNotes] = useState<LocalNote[]>([]);
   const [state, setState] = useState<StateView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // values read from an uploaded payslip, waiting for the employee's confirmation
+  const [payslip, setPayslip] = useState<PayslipExtraction | null>(null);
   const activeId = useRef(sessionId);
 
   const adopt = useCallback((id: string | null) => {
@@ -104,7 +111,7 @@ export function useEmployeeSession() {
     (empId: string) =>
       run(async () => {
         adopt(null);
-        setNotes([]);
+        setPayslip(null);
         setMessages([]);
         setState(null);
         const r = await api.loadDemo(empId); // the server opens a new conversation
@@ -125,26 +132,55 @@ export function useEmployeeSession() {
     [run, refresh],
   );
 
+  /** Read a payslip: the server proposes values; nothing is saved yet. */
+  const uploadPayslip = useCallback(
+    (file: File) =>
+      run(async () => {
+        setPayslip(null);
+        if (!isPdf(file)) throw new ApiError(415, "אפשר להעלות רק תלוש שכר בפורמט PDF");
+        setPayslip(await api.extractPayslip(file));
+      }),
+    [run],
+  );
+
+  /** The employee confirmed (possibly corrected) values: save them and continue the chat. */
+  const confirmPayslip = useCallback(
+    (values: PayslipValues) =>
+      run(async () => {
+        const r = await api.applyPayslip(activeId.current, values);
+        setPayslip(null);
+        adopt(r.session_id);
+        setNotice(r.notice ?? null);
+        await refresh(r.session_id);
+      }),
+    [run, adopt, refresh],
+  );
+
+  const cancelPayslip = useCallback(() => setPayslip(null), []);
+
   const reset = useCallback(() => {
     adopt(null);
     setMessages([]);
-    setNotes([]);
     setState(null);
     setError(null);
     setNotice(null);
+    setPayslip(null);
   }, [adopt]);
 
-  const addLocalNote = useCallback((content: string) => {
-    setNotes((n) => [
-      ...n,
-      { role: "employee", content, created_at: new Date().toISOString(), local: true },
-    ]);
-  }, []);
-
-  // server stamps "…+00:00" (seconds), client stamps "…Z" (ms): compare as dates; stable sort
-  const items: ChatItem[] = [...messages, ...notes].sort(
-    (a, b) => Date.parse(a.created_at) - Date.parse(b.created_at),
-  );
-
-  return { sessionId, items, state, busy, error, notice, send, loadDemo, setAlternative, reset, addLocalNote };
+  return {
+    sessionId,
+    messages,
+    state,
+    busy,
+    error,
+    notice,
+    payslip,
+    send,
+    loadDemo,
+    setAlternative,
+    reset,
+    uploadPayslip,
+    confirmPayslip,
+    cancelPayslip,
+  };
 }

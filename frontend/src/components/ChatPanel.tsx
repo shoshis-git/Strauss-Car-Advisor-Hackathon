@@ -1,16 +1,17 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { StateView } from "../api";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import type { Message, StateView } from "../api";
 import { boldSegments, timeOf } from "../format";
-import type { ChatItem } from "../useEmployeeSession";
 
 interface Props {
-  items: ChatItem[];
+  items: Message[];
   state: StateView | null;
   busy: boolean;
   error: string | null;
   notice?: string | null;
   onSend: (text: string) => void;
-  onUpload: (fileName: string) => void;
+  onUpload: (file: File) => void;
+  /** e.g. the payslip review card, shown above the input */
+  review?: ReactNode;
 }
 
 const ROLE_STYLE: Record<string, { label: string; bubble: string; align: string }> = {
@@ -31,7 +32,7 @@ function RichText({ text }: { text: string }) {
   );
 }
 
-export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload }: Props) {
+export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload, review }: Props) {
   const [text, setText] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -48,12 +49,10 @@ export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload 
     setText("");
   }
 
-  const visible = items; // internal tool messages never leave the server
-
   return (
     <section className="flex min-h-[28rem] flex-1 flex-col rounded-2xl border border-slate-200 bg-slate-100/60 shadow-sm">
       <div className="flex-1 space-y-3 overflow-y-auto p-4" aria-live="polite">
-        {visible.length === 0 && !busy && (
+        {items.length === 0 && !busy && !review && (
           <div className="mx-auto mt-10 max-w-sm text-center text-slate-500">
             <p className="text-lg font-semibold text-slate-700">שלום! אני יועץ הרכב 👋</p>
             <p className="mt-2 text-sm">
@@ -61,20 +60,19 @@ export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload 
               אפשרי, ואז אחשב כמה זה ישנה בנטו. או בחר/י עובד הדגמה למעלה.
             </p>
             <p className="mt-2 text-xs text-slate-400">
-              📎 אפשר גם לצרף תלוש או חוזה (כרגע הדמיה - הנתונים עדיין נמסרים בצ׳אט).
+              📎 אפשר גם לצרף תלוש שכר דיגיטלי (PDF): הנתונים יוצגו לאישורך לפני שמירה, פרטים מזהים
+              מושחרים והקובץ לא נשמר.
             </p>
           </div>
         )}
-        {visible.map((m, i) => {
+        {items.map((m, i) => {
           const style = ROLE_STYLE[m.role] ?? ROLE_STYLE.assistant;
-          const local = "local" in m;
           return (
             <div key={i} className={`flex ${style.align}`}>
               <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 shadow-sm ${style.bubble}`}>
                 <div className="mb-0.5 flex items-center gap-2 text-[11px] opacity-75">
                   <span className="font-semibold">{style.label}</span>
                   <span className="num">{timeOf(m.created_at)}</span>
-                  {local && <span>(הדמיה - לא נשלח לשרת)</span>}
                 </div>
                 <div className="whitespace-pre-wrap leading-relaxed">
                   <RichText text={m.content} />
@@ -105,6 +103,7 @@ export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload 
           <p className="mt-1 text-xs text-amber-800">החישוב יתעדכן כאן אוטומטית ברגע שתתקבל תשובה.</p>
         </div>
       )}
+      {review}
       {notice && !error && (
         <div className="border-t border-sky-200 bg-sky-50 px-4 py-2 text-xs text-sky-900" data-testid="llm-notice">
           ℹ️ {notice}
@@ -120,20 +119,22 @@ export function ChatPanel({ items, state, busy, error, notice, onSend, onUpload 
         <input
           ref={fileRef}
           type="file"
-          accept=".pdf,image/*"
+          accept="application/pdf,.pdf"
           className="hidden"
+          aria-label="קובץ תלוש שכר"
           onChange={(e) => {
             const f = e.target.files?.[0];
-            if (f) onUpload(f.name);
+            if (f) onUpload(f);
             e.target.value = "";
           }}
         />
         <button
           type="button"
           onClick={() => fileRef.current?.click()}
-          title="העלאת תלוש / חוזה (הדמיה)"
-          aria-label="העלאת תלוש או חוזה (הדמיה)"
-          className="rounded-xl border border-slate-300 px-3 py-2.5 text-lg hover:bg-slate-100"
+          disabled={busy || !!state?.waiting_for_rep}
+          title="העלאת תלוש שכר (PDF)"
+          aria-label="העלאת תלוש שכר (PDF)"
+          className="rounded-xl border border-slate-300 px-3 py-2.5 text-lg hover:bg-slate-100 disabled:opacity-40"
         >
           📎
         </button>

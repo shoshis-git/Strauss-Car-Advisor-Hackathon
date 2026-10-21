@@ -23,10 +23,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..data_loader.config_loader import AppConfig, get_config
-from .formatting import format_comparison
+from .formatting import fmt_ils, format_comparison
 from .llm import REP_PREFIX, LLMClient, LLMError, make_llm
 from .prompts import build_system_prompt
-from .state import (ConversationState, CurrentSituation, EmployeeProfile, StateStore,
+from .state import (FIELD_LABELS, ConversationState, CurrentSituation, EmployeeProfile, StateStore,
                     TargetChoice, compute_missing, is_blocked, participation_unknown_field)
 from .tools import TOOL_SPECS, execute_tool
 
@@ -178,6 +178,27 @@ class AdvisorAgent:
         state.add_message("assistant", reply)
         self.store.save(state)
         return AgentReply(reply, state, called)
+
+    def apply_payslip(self, conversation_id: str, values: dict[str, Any]) -> AgentReply:
+        """Values the employee confirmed from their payslip: saved with the same tool (and
+        audit trail) as chat answers, then the advisor continues the conversation."""
+        state = self.store.load(conversation_id)
+        if state.waiting_for_rep:
+            raise RuntimeError("conversation is waiting for a representative")
+        shown = []
+        for k, v in values.items():
+            label = FIELD_LABELS[k].split(" (")[0]
+            shown.append(f"{label}: {v}" if isinstance(v, str)
+                         else f"{label}: {v:g}%" if k.endswith("_pct")
+                         else f"{label}: {v:g}" if k == "credit_points"
+                         else f"{label}: {fmt_ils(v)} ₪")
+        state.add_message("employee", "📎 אישרתי את הנתונים מתלוש השכר: " + ", ".join(shown))
+        if "current_participation" in values and state.participation_unknown == "current_participation":
+            state.participation_unknown = None  # the payslip deduction is the official value
+        result = execute_tool("update_profile", dict(values), state, self.config)
+        state.add_message("tool", json.dumps(result, ensure_ascii=False),
+                          tool_name="update_profile", tool_input=dict(values))
+        return self._run_turn(state)
 
     def set_alternative(self, conversation_id: str, car_id: Optional[str] = None,
                         waiver: bool = False) -> AgentReply:

@@ -7,15 +7,18 @@ import weakref
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request, Security
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security import APIKeyHeader
 
 from ..agent.graph import AdvisorAgent, AgentReply
+from ..agent.payslip import MAX_BYTES as PAYSLIP_MAX_BYTES
+from ..agent.payslip import PayslipError, extract_payslip
 from ..agent.state import ConversationState
 from ..data_loader.config_loader import AppConfig
 from ..engine.eligibility import tax_value_of_use
 from .schemas import (CHAT_EXAMPLES, SESSION_ID_PATTERN, AlternativeBody, CarView, ChatRequest,
-                      ChatResponse, MessageView, RepAnswerRequest, RepAnswerResponse,
-                      SessionResponse, StateView, Ticket)
+                      ChatResponse, MessageView, PayslipApplyRequest, PayslipExtractResponse,
+                      RepAnswerRequest, RepAnswerResponse, SessionResponse, StateView, Ticket)
 
 SessionId = Path(..., pattern=SESSION_ID_PATTERN)
 
@@ -217,6 +220,55 @@ def set_alternative(body: AlternativeBody, request: Request,
             reply = agent.set_alternative(session_id, body.car_id, body.waiver)
         except KeyError:
             raise HTTPException(404, f"car {body.car_id} not in catalogue") from None
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from None
+    return _chat_response(reply)
+
+
+# --------------------------------------------------------------------------- #
+# Payslip upload: extract (nothing stored) -> employee confirms -> apply
+# --------------------------------------------------------------------------- #
+_TOO_BIG = f"הקובץ גדול מדי (מעל {PAYSLIP_MAX_BYTES // (1024 * 1024)}MB)"
+
+
+@router.post("/payslip/extract", response_model=PayslipExtractResponse, openapi_extra={
+    "requestBody": {"required": True,
+                    "content": {"application/pdf": {"schema": {"type": "string",
+                                                                "format": "binary"}}}}})
+async def payslip_extract(request: Request) -> dict[str, Any]:
+    """Body: the payslip PDF itself (Content-Type: application/pdf). The file is read in
+    memory and discarded; identifying details are masked before the language model sees
+    the text. Returns proposed values with the payslip line each came from."""
+    if request.headers.get("content-type", "").split(";")[0].strip() != "application/pdf":
+        raise HTTPException(415, "אפשר להעלות רק תלוש שכר בפורמט PDF")
+    if int(request.headers.get("content-length") or 0) > PAYSLIP_MAX_BYTES:
+        raise HTTPException(413, _TOO_BIG)
+    data = bytearray()
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > PAYSLIP_MAX_BYTES:  # a lying / missing Content-Length
+            raise HTTPException(413, _TOO_BIG)
+    try:
+        res = await run_in_threadpool(extract_payslip, bytes(data), _agent(request).llm,
+                                      _config(request))
+    except PayslipError as e:
+        raise HTTPException(e.status, str(e)) from None
+    return res.as_dict()
+
+
+@router.post("/payslip/apply", response_model=ChatResponse)
+def payslip_apply(body: PayslipApplyRequest, request: Request) -> ChatResponse:
+    """Save the values the employee confirmed (possibly corrected) and continue the chat.
+    Without session_id a new conversation is opened."""
+    agent = _agent(request)
+    if body.session_id is None:
+        session_id = agent.start_conversation().conversation_id
+    else:
+        session_id = body.session_id
+        _load(agent, session_id)
+    with _locks(request)(session_id):
+        try:
+            reply = agent.apply_payslip(session_id, body.values.model_dump(exclude_none=True))
         except RuntimeError as e:
             raise HTTPException(409, str(e)) from None
     return _chat_response(reply)
