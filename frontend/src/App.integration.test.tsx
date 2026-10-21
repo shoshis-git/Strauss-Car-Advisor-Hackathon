@@ -8,6 +8,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { API_BASE } from "./api";
 import App from "./App";
+// synthetic payslip with the pay data of sample employee E-004 (fictional person)
+import e004Pdf from "../../backend/tests/fixtures/payslip_e004.pdf?inline";
 
 async function backendInfo(): Promise<{ deterministic: boolean } | null> {
   try {
@@ -91,6 +93,35 @@ describe.skipIf(!health)("App ↔ backend", () => {
       await waitFor(() => expect(screen.queryByTestId("blocked")).toBeNull(), T);
       // now the (single-round) salary questionnaire starts
       await waitFor(() => expect(screen.getAllByText(/שכר בסיס/).length).toBeGreaterThan(0), T);
+    },
+    30000,
+  );
+
+  it.skipIf(!deterministic)(
+    "payslip upload → review → confirm → one message about the cars → Excel E-004 result",
+    async () => {
+      const pdf = await (await fetch(e004Pdf)).arrayBuffer();
+      render(<App />);
+      const input = (await screen.findByLabelText("קובץ תלוש שכר", {}, T)) as HTMLInputElement;
+      const file = new File([pdf], "payslip.pdf", { type: "application/pdf" });
+      Object.defineProperty(input, "files", { value: [file] });
+      fireEvent.change(input);
+      await waitFor(() => {
+        // an upload error is shown as an alert - surface it instead of a bare "not found"
+        expect(screen.queryAllByRole("alert").map((e) => e.textContent).join(" ")).toBe("");
+        expect(screen.getByTestId("payslip-review")).toBeTruthy();
+      }, T);
+      const review = screen.getByTestId("payslip-review");
+      expect((within(review).getByLabelText("ערך: שכר בסיס") as HTMLInputElement).value).toBe("16000");
+      expect(review.textContent).not.toContain("123456782"); // the ID never comes back
+      fireEvent.click(within(review).getByRole("button", { name: "אישור ושמירה" }));
+      await screen.findByText(/אישרתי את הנתונים מתלוש השכר/, {}, T);
+
+      const box = screen.getByLabelText("הודעה ליועץ");
+      await waitFor(() => expect((box as HTMLTextAreaElement).disabled).toBe(false), T);
+      fireEvent.change(box, { target: { value: "היום יש לי טוסון ואני רוצה לעבור ל-EV3" } });
+      fireEvent.click(screen.getByRole("button", { name: "שליחה" }));
+      await waitFor(() => expect(screen.getByTestId("net-diff").textContent).toContain("+1,207 ₪"), T);
     },
     30000,
   );

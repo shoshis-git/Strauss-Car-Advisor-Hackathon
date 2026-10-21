@@ -4,6 +4,7 @@ import { useEmployeeSession } from "../useEmployeeSession";
 import { ChatPanel } from "./ChatPanel";
 import { ComparisonDashboard } from "./ComparisonDashboard";
 import { DemoSelector } from "./DemoSelector";
+import { PayslipReview } from "./PayslipReview";
 
 export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[] }) {
   const s = useEmployeeSession();
@@ -40,15 +41,21 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
           onNew={s.reset}
         />
         <ChatPanel
-          items={s.items}
+          items={s.messages}
           state={s.state}
           busy={s.busy}
           error={s.error}
           notice={s.notice}
           onSend={s.send}
-          onUpload={(name) =>
-            s.addLocalNote(
-              `📎 הועלה הקובץ "${name}". בגרסת הפיילוט התלוש/החוזה ייקרא אוטומטית וימלא את הנתונים.`,
+          onUpload={s.uploadPayslip}
+          review={
+            s.payslip && (
+              <PayslipReview
+                extraction={s.payslip}
+                busy={s.busy}
+                onConfirm={s.confirmPayslip}
+                onCancel={s.cancelPayslip}
+              />
             )
           }
         />

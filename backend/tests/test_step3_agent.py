@@ -483,6 +483,11 @@ def test_changing_the_current_car_drops_its_participation():
     assert st.current.current_participation is None
     update_profile(st, CONFIG, current_car="קורולה", current_participation=250)  # same call
     assert st.current.current_participation == 250
+    # a participation known before any car (e.g. from the payslip) belongs to the first car
+    st = ConversationState()
+    update_profile(st, CONFIG, current_participation=400)
+    update_profile(st, CONFIG, current_car="טוסון")
+    assert st.current.current_participation == 400
 
 
 def test_start_new_case_tool_resets_everything(agent, after_picanto):

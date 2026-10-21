@@ -242,8 +242,9 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
             if car is None:
                 errors.append(car_not_found_error(config, "current_car", raw))
             else:
-                if cur.current_car_code != car.car_id:
+                if cur.current_car_code not in (None, car.car_id):
                     # a participation belongs to one car: never carry it to another one
+                    # (a value given before any car was named - e.g. from the payslip - stays)
                     if "current_participation" not in updated:
                         cur.current_participation = None
                     cur.current_maintenance = None

@@ -107,6 +107,32 @@ export interface SessionResponse {
   updated_at: string;
 }
 
+export type PayslipFieldName =
+  | "occupation"
+  | "base_salary"
+  | "commissions_bonuses"
+  | "pension_pct"
+  | "hishtalmut_pct"
+  | "credit_points"
+  | "current_participation";
+
+export interface PayslipField {
+  field: PayslipFieldName;
+  label: string;
+  value: number | string;
+  /** the payslip line (after redaction) the value was read from */
+  evidence: string;
+}
+
+/** Proposed values only - nothing is saved until the employee confirms them. */
+export interface PayslipExtraction {
+  fields: PayslipField[];
+  not_found: string[];
+  rejected: string[];
+}
+
+export type PayslipValues = Partial<Record<PayslipFieldName, number | string>>;
+
 export interface CarSummary {
   car_id: string;
   model_name: string;
@@ -225,6 +251,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+function readBytes(file: Blob): Promise<ArrayBuffer> {
+  if (typeof file.arrayBuffer === "function") return file.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader(); // older engines (and jsdom) lack Blob.arrayBuffer
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 const post = <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
   request<T>(path, {
     method: "POST",
@@ -243,6 +279,16 @@ export const api = {
   options: (id: string) => request<Options>(`/api/session/${id}/options`),
   setAlternative: (id: string, choice: { car_id: string } | { waiver: true }) =>
     post<ChatResponse>(`/api/session/${id}/alternative`, choice),
+  /** the PDF itself is the body; the server reads it in memory and keeps nothing */
+  extractPayslip: async (file: Blob) =>
+    request<PayslipExtraction>("/api/payslip/extract", {
+      method: "POST",
+      body: await readBytes(file), // raw bytes: portable across fetch implementations
+      headers: { "Content-Type": "application/pdf" },
+    }),
+  /** sessionId null = the payslip comes before any message: a new conversation is opened */
+  applyPayslip: (sessionId: string | null, values: PayslipValues) =>
+    post<ChatResponse>("/api/payslip/apply", sessionId ? { session_id: sessionId, values } : { values }),
   tickets: () => request<Ticket[]>("/api/rep/tickets", { headers: repHeaders() }),
   answer: (id: string, answer_text: string, participation?: number) =>
     post<RepAnswerResponse>(`/api/rep/tickets/${id}/answer`, { answer_text, participation }, repHeaders()),

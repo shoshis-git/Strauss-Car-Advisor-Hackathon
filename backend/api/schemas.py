@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..agent.state import (FIELD_LABELS, ConversationState, CurrentSituation, EmployeeProfile,
                            TargetChoice)
@@ -73,6 +73,45 @@ class ChatResponse(BaseModel):
     frozen: bool
     llm_fallback: bool = Field(False, description="התור נענה במצב הדטרמיניסטי כי ה-LLM לא זמין")
     notice: Optional[str] = None
+
+
+# --- payslip ------------------------------------------------------------------ #
+class PayslipField(BaseModel):
+    field: str
+    label: str
+    value: float | str
+    evidence: str = Field(description="השורה מהתלוש (אחרי השחרה) שממנה נלקח הערך")
+
+
+class PayslipExtractResponse(BaseModel):
+    """Proposed values only - nothing is saved until the employee confirms them."""
+    fields: list[PayslipField]
+    not_found: list[str]
+    rejected: list[str]
+
+
+class PayslipValues(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    occupation: Optional[str] = Field(None, min_length=1, max_length=100)
+    base_salary: Optional[float] = Field(None, gt=0, le=1_000_000)
+    commissions_bonuses: Optional[float] = Field(None, ge=0, le=1_000_000)
+    pension_pct: Optional[float] = Field(None, ge=0, le=100)
+    hishtalmut_pct: Optional[float] = Field(None, ge=0, le=100)
+    credit_points: Optional[float] = Field(None, ge=0, le=30)
+    current_participation: Optional[float] = Field(None, ge=0, le=100_000)
+
+
+class PayslipApplyRequest(BaseModel):
+    session_id: Optional[str] = Field(
+        None, pattern=SESSION_ID_PATTERN,
+        description="אופציונלי - בלי מזהה נפתחת שיחה חדשה (תלוש לפני הודעה ראשונה)")
+    values: PayslipValues
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> "PayslipApplyRequest":
+        if not self.values.model_dump(exclude_none=True):
+            raise ValueError("no values to apply")
+        return self
 
 
 class AlternativeBody(BaseModel):
