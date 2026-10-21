@@ -826,3 +826,31 @@ def test_live_llm_extracts_salary(store):
     conv = agent.start_conversation().conversation_id
     st = agent.handle_employee_message(conv, "שכר בסיס 14,200 קבוצה ג'").state
     assert (st.profile.base_salary, st.profile.eligibility_group) == (14200, "ג")
+
+
+def test_store_selection(tmp_path, monkeypatch):
+    from backend.agent.state import make_state_store
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.setenv("STRAUSS_SESSIONS_DB", str(tmp_path / "env.db"))
+    assert make_state_store().db_path == tmp_path / "env.db"
+    # an explicit path (tests) always wins over DATABASE_URL
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    assert isinstance(make_state_store(tmp_path / "arg.db"), StateStore)
+
+
+@pytest.mark.skipif(not os.environ.get("TEST_DATABASE_URL"),
+                    reason="set TEST_DATABASE_URL to a disposable Postgres to run")
+def test_postgres_store_roundtrip():
+    from backend.agent.state import PostgresStateStore
+    store = PostgresStateStore(os.environ["TEST_DATABASE_URL"])
+    state = ConversationState()
+    state.profile.base_salary = 14200
+    state.waiting_for_rep = True
+    store.save(state)
+    assert store.load(state.conversation_id).profile.base_salary == 14200
+    assert state.conversation_id in store.waiting_for_rep()
+    state.waiting_for_rep = False
+    store.save(state)                       # upsert, not a duplicate row
+    assert state.conversation_id not in store.waiting_for_rep()
+    with pytest.raises(KeyError):
+        store.load("no-such-conversation")

@@ -1,7 +1,8 @@
-"""Conversation state of the car advisor + its SQLite persistence."""
+"""Conversation state of the car advisor + its persistence (SQLite locally, Postgres in production)."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -251,3 +252,68 @@ class StateStore:
         finally:
             conn.close()
         return [r[0] for r in rows]
+
+
+class PostgresStateStore:
+    """Same interface as StateStore, in Postgres (e.g. Supabase) - survives redeploys.
+
+    Works through Supabase's pooler (transaction mode, port 6543): prepared statements
+    are disabled because the pooler does not keep them between transactions.
+    """
+
+    def __init__(self, dsn: str):
+        import psycopg  # only needed in production (requirements.txt)
+
+        self._psycopg, self.dsn = psycopg, dsn
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversations ("
+                "conversation_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, "
+                "waiting_for_rep BOOLEAN NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            # salary data: no access through Supabase's public REST API (no policies).
+            # The table owner (this connection) is not affected by RLS.
+            conn.execute("ALTER TABLE conversations ENABLE ROW LEVEL SECURITY")
+
+    def _connect(self):
+        return self._psycopg.connect(self.dsn, prepare_threshold=None, connect_timeout=10)
+
+    def save(self, state: ConversationState) -> None:
+        state.updated_at = _now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO conversations VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (conversation_id) DO UPDATE SET state_json=EXCLUDED.state_json, "
+                "waiting_for_rep=EXCLUDED.waiting_for_rep, updated_at=EXCLUDED.updated_at",
+                (state.conversation_id, state.model_dump_json(),
+                 state.waiting_for_rep, state.updated_at),
+            )
+
+    def load(self, conversation_id: str) -> ConversationState:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state_json FROM conversations WHERE conversation_id=%s",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return ConversationState.model_validate(json.loads(row[0]))
+
+    def waiting_for_rep(self) -> list[str]:
+        """Conversation ids waiting for a representative (the rep's inbox)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT conversation_id FROM conversations WHERE waiting_for_rep "
+                "ORDER BY updated_at"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+
+def make_state_store(db_path: Optional[Path] = None):
+    """argument > DATABASE_URL (Postgres) > STRAUSS_SESSIONS_DB env > data/app_data.db"""
+    if db_path is not None:
+        return StateStore(db_path)
+    dsn = os.environ.get("DATABASE_URL", "").strip()
+    if dsn:
+        return PostgresStateStore(dsn)
+    return StateStore(Path(os.environ.get("STRAUSS_SESSIONS_DB", paths.APP_DB)))
