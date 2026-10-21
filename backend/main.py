@@ -17,9 +17,8 @@ from fastapi.responses import JSONResponse
 
 from .agent.graph import AdvisorAgent
 from .agent.llm import LLMClient, LLMError, load_env_file, make_llm, read_env_file
-from .agent.state import StateStore
+from .agent.state import make_state_store
 from .api.routes import SessionLocks, rep_router, router
-from .data_loader import paths
 from .data_loader.config_loader import get_config
 from .data_loader.tax_loader import get_tax_db
 
@@ -48,8 +47,8 @@ def create_app(db_path: Optional[Path] = None, llm: Optional[LLMClient] = None,
         load_env_file()
         config = get_config()      # rules.json + challenge_data.xlsx + car_aliases.json
         tax_db = get_tax_db()      # builds/validates the indexed Tax Authority table
-        # conversations DB: argument > STRAUSS_SESSIONS_DB env > data/app_data.db
-        store = StateStore(db_path or Path(os.environ.get("STRAUSS_SESSIONS_DB", paths.APP_DB)))
+        # conversations DB: argument > DATABASE_URL (Postgres) > STRAUSS_SESSIONS_DB > app_data.db
+        store = make_state_store(db_path)
         agent = AdvisorAgent(config, store, llm or make_llm(config))
         app.state.config, app.state.tax_db, app.state.agent = config, tax_db, agent
         app.state.session_locks = SessionLocks()
