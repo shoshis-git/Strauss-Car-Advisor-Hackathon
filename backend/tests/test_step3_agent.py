@@ -380,6 +380,50 @@ def test_openai_compatible_adapter_runs_full_tool_loop(store):
     assert json.loads(second[-1]["content"])["updated"]["base_salary"] == 14200
 
 
+def test_provider_tool_call_extras_are_echoed_back(store):
+    """Gemini 3 rejects (HTTP 400) a follow-up request whose function call lost its
+    thought_signature. The adapter must return tool calls exactly as received."""
+    signed = _tool_call_response("update_profile", {"base_salary": 14200})
+    signed["choices"][0]["message"]["tool_calls"][0]["extra_content"] = {
+        "google": {"thought_signature": "SIG-123"}}
+
+    class GeminiLike(FakeChatCompletions):
+        def __call__(self, url, headers, body, timeout):
+            for m in body["messages"]:
+                for tc in m.get("tool_calls") or []:
+                    if tc.get("extra_content", {}).get("google", {}).get(
+                            "thought_signature") != "SIG-123":
+                        raise LLMError("LLM HTTP 400: Function call is missing a thought_signature")
+            return super().__call__(url, headers, body, timeout)
+
+    server = GeminiLike([signed, _text_response("תודה!")])
+    llm = OpenAICompatibleLLM("gemini-3.8-flash", "https://g.example/v1", "k", transport=server)
+    agent = AdvisorAgent(CONFIG, store, llm)
+    conv = agent.start_conversation().conversation_id
+    reply = agent.handle_employee_message(conv, "שכר בסיס 14,200")
+    assert reply.text == "תודה!" and reply.state.profile.base_salary == 14200
+    echoed = server.requests[1][2]["messages"][-2]["tool_calls"][0]
+    assert echoed["extra_content"]["google"]["thought_signature"] == "SIG-123"
+
+
+def test_api_key_never_appears_in_repr_or_tracebacks():
+    import uuid
+    key = uuid.uuid4().hex  # generated, so it is not in this file's source lines
+
+    def failing_transport(url, headers, body, timeout):
+        raise LLMError(f"boom {headers!r}")
+
+    llm = OpenAICompatibleLLM("m", "https://x.example/v1", key, transport=failing_transport)
+    with pytest.raises(LLMError) as exc:
+        llm.step(system="s", messages=[], tools=[], state=ConversationState())
+    assert key not in str(exc.value) and "'***'" in str(exc.value)
+    assert key not in repr(llm.api_key)
+    # what pytest prints by default for a failure: source + arguments of every frame
+    # (this is where the key leaked before: `headers = {'Authorization': 'Bearer ...'}`)
+    printed = str(exc.getrepr(style="long", funcargs=True))
+    assert "headers = " in printed and key not in printed
+
+
 def test_adapter_tolerates_missing_ids_and_bad_arguments():
     from backend.agent.llm import parse_completion
     step = parse_completion({"choices": [{"message": {"content": "", "tool_calls": [
