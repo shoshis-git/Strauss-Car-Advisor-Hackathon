@@ -13,6 +13,8 @@ const EXTRACTION: PayslipExtraction = {
   ],
   not_found: ["נקודות זיכוי"],
   rejected: ["אחוז הפרשת עובד לקרן השתלמות: הערך 400 לא נמצא בתלוש"],
+  source: "text",
+  checks: [],
 };
 
 function setup() {
@@ -50,6 +52,55 @@ describe("PayslipReview", () => {
       fireEvent.click(screen.getByLabelText(`לכלול: ${label}`));
     }
     expect(confirm.disabled).toBe(true); // nothing selected
+  });
+
+  it("a payslip read from its image is flagged, with the payslip's own arithmetic", () => {
+    render(
+      <PayslipReview
+        extraction={{
+          ...EXTRACTION,
+          source: "image",
+          checks: [
+            { ok: true, text: "סכום שורות הניכויים 15.00 = סה\"כ ניכויים 15.00" },
+            { ok: false, text: "תשלומים 385.00 פחות ניכויים 15.00 ≠ נטו 340.00" },
+          ],
+        }}
+        busy={false}
+        onConfirm={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    const banner = screen.getByTestId("image-source");
+    expect(banner.textContent).toContain("נקרא מתמונה");
+    expect(banner.textContent).toContain("✓ סכום שורות הניכויים");
+    expect(banner.textContent).toContain("✗ תשלומים 385.00");
+    expect(banner.textContent).toContain("ייתכן שספרה נקראה לא נכון");
+  });
+
+  it("an unreadable payslip asks before its image is sent, and says what the image holds", () => {
+    const onReadImage = vi.fn();
+    const onCancel = vi.fn();
+    const unreadable: PayslipExtraction = {
+      fields: [], not_found: [], rejected: [], source: null, checks: [],
+      unreadable: "לא הצלחתי לקרוא את הטקסט בתלוש", vision_available: true,
+    };
+    render(<PayslipReview extraction={unreadable} busy={false} onConfirm={() => {}}
+      onCancel={onCancel} onReadImage={onReadImage} />);
+    const card = screen.getByTestId("payslip-consent");
+    expect(card.textContent).toContain("כולל ת״ז וחשבון בנק");
+    expect(onReadImage).not.toHaveBeenCalled(); // nothing happens without a click
+    fireEvent.click(screen.getByRole("button", { name: "שליחה לקריאה" }));
+    expect(onReadImage).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: /ביטול/ }));
+    expect(onCancel).toHaveBeenCalled();
+  });
+
+  it("without image reading on the server, only the chat is offered", () => {
+    render(<PayslipReview busy={false} onConfirm={() => {}} onCancel={() => {}} onReadImage={() => {}}
+      extraction={{ fields: [], not_found: [], rejected: [], source: null, checks: [],
+                    unreadable: "נראה שזה צילום או סריקה", vision_available: false }} />);
+    expect(screen.queryByRole("button", { name: "שליחה לקריאה" })).toBeNull();
+    expect(screen.getByRole("button", { name: /סגירה/ })).toBeTruthy();
   });
 
   it("cancel discards the proposal", () => {

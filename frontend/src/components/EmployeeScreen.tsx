@@ -55,6 +55,7 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
                 busy={s.busy}
                 onConfirm={s.confirmPayslip}
                 onCancel={s.cancelPayslip}
+                onReadImage={s.readPayslipImage}
               />
             )
           }

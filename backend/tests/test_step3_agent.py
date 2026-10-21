@@ -11,8 +11,9 @@ import os
 import pytest
 
 from backend.agent.graph import AdvisorAgent
-from backend.agent.llm import (LLMError, LLMStep, OpenAICompatibleLLM, ToolCall,
-                               assistant_message, load_env_file, make_llm)
+from backend.agent.llm import (GEMINI_FOREIGN_SIGNATURE, ORIGIN_KEY, FailoverLLM, LLMError,
+                               LLMStep, OpenAICompatibleLLM, ToolCall, assistant_message,
+                               load_env_file, make_llm)
 from backend.agent.rule_based import RuleBasedLLM, extract_fields
 from backend.agent.state import ConversationState, StateStore
 from backend.agent.tools import TOOL_SPECS, find_cars_in_text, resolve_car, update_profile
@@ -599,6 +600,8 @@ def test_gemini_real_error_texts_are_classified_by_status():
     ("openai", "https://api.openai.com/v1"),
     ("anthropic", "https://api.anthropic.com/v1"),
     ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    ("groq", "https://api.groq.com/openai/v1"),
+    ("openrouter", "https://openrouter.ai/api/v1"),
     ("ollama", "http://localhost:11434/v1"),
 ])
 def test_provider_selection_from_env(provider, base_url):
@@ -619,6 +622,169 @@ def test_base_url_override_and_config_errors():
         make_llm(CONFIG, env={"LLM_PROVIDER": "openai_compatible", "LLM_MODEL": "m"})
     with pytest.raises(LLMError, match="unknown"):
         make_llm(CONFIG, env={"LLM_PROVIDER": "nope", "LLM_MODEL": "m"})
+
+
+# --------------------------------------------------------------------------- #
+# Several providers / keys: LLM_PROVIDER, LLM_PROVIDER_2, ... -> FailoverLLM
+# --------------------------------------------------------------------------- #
+THREE_PROVIDERS = {
+    "LLM_PROVIDER": "gemini", "LLM_MODEL": "g", "LLM_API_KEY": "k1",
+    "LLM_PROVIDER_2": "groq", "LLM_MODEL_2": "q", "GROQ_API_KEY": "k2",  # provider's own var
+    "LLM_PROVIDER_3": "openrouter", "LLM_MODEL_3": "o", "LLM_API_KEY_3": "k3",
+}
+
+
+def test_backup_providers_are_read_from_numbered_variables():
+    llm = make_llm(CONFIG, env=THREE_PROVIDERS)
+    assert isinstance(llm, FailoverLLM)
+    assert [c.label for c in llm.clients] == ["gemini:g", "groq:q", "openrouter:o"]
+    assert [c.api_key for c in llm.clients] == ["k1", "k2", "k3"]
+    assert llm.clients[1].base_url == "https://api.groq.com/openai/v1"
+    # one provider -> the plain client, as before
+    single = make_llm(CONFIG, env={k: v for k, v in THREE_PROVIDERS.items() if "_2" not in k
+                                   and "_3" not in k and k != "GROQ_API_KEY"})
+    assert isinstance(single, OpenAICompatibleLLM)
+
+
+def test_two_keys_of_the_same_provider():
+    llm = make_llm(CONFIG, env={"LLM_PROVIDER": "gemini", "LLM_MODEL": "g", "LLM_API_KEY": "a",
+                                "LLM_PROVIDER_2": "gemini", "LLM_MODEL_2": "g",
+                                "LLM_API_KEY_2": "b"})
+    assert [c.api_key for c in llm.clients] == ["a", "b"]
+
+
+def test_backup_slot_errors_name_their_own_variables():
+    bad = {**THREE_PROVIDERS, "LLM_MODEL_3": ""}
+    with pytest.raises(LLMError, match="LLM_MODEL_3"):
+        make_llm(CONFIG, env=bad)
+    with pytest.raises(LLMError, match="LLM_API_KEY_2"):
+        make_llm(CONFIG, env={k: v for k, v in THREE_PROVIDERS.items() if k != "GROQ_API_KEY"})
+    with pytest.raises(LLMError, match="LLM_FALLBACK=rules"):
+        make_llm(CONFIG, env={**THREE_PROVIDERS, "LLM_PROVIDER_2": "rules"})
+
+
+HEALTHY = "healthy"
+
+
+class FlakyLLM:
+    """Answers with a fixed text, or fails with the given HTTP status (None = network
+    error, as LLMError uses it); counts calls."""
+
+    def __init__(self, label, fail_status=HEALTHY):
+        self.label, self.fail_status, self.calls = label, fail_status, 0
+
+    def step(self, **kw):
+        self.calls += 1
+        if self.fail_status != HEALTHY:
+            raise LLMError(f"HTTP {self.fail_status}", status=self.fail_status)
+        return LLMStep(self.label, [], assistant_message(self.label, []))
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _ask(llm):
+    return llm.step(system="s", messages=[{"role": "user", "content": "x"}], tools=[],
+                    state=ConversationState()).text
+
+
+def test_quota_on_the_primary_moves_to_the_backup_and_comes_back_after_the_cooldown():
+    clock = Clock()
+    gemini, groq = FlakyLLM("gemini", 429), FlakyLLM("groq")
+    llm = FailoverLLM([gemini, groq], cooldown_s=600, clock=clock)
+    assert _ask(llm) == "groq" and gemini.calls == 1
+    assert _ask(llm) == "groq" and gemini.calls == 1   # cooling down: not even tried
+    gemini.fail_status = HEALTHY                          # the daily quota was reset
+    clock.now += 601
+    assert _ask(llm) == "gemini" and gemini.calls == 2  # the primary is back first
+
+
+@pytest.mark.parametrize("status", [402, 401, 403, 404, 500, 503, None])
+def test_every_provider_level_failure_moves_on_with_a_cooldown(status):
+    first, second = FlakyLLM("a", status), FlakyLLM("b")
+    llm = FailoverLLM([first, second], cooldown_s=600, clock=Clock())
+    assert _ask(llm) == "b" and _ask(llm) == "b"
+    assert first.calls == 1
+
+
+def test_a_refused_request_moves_on_without_benching_the_provider():
+    """400 = this request (e.g. an image for a text-only model), not the provider."""
+    first, second = FlakyLLM("a", 400), FlakyLLM("b")
+    llm = FailoverLLM([first, second], cooldown_s=600, clock=Clock())
+    assert _ask(llm) == "b"
+    first.fail_status = HEALTHY
+    assert _ask(llm) == "a"  # tried again right away
+
+
+def test_when_every_provider_fails_the_last_error_is_raised():
+    llm = FailoverLLM([FlakyLLM("a", 429), FlakyLLM("b", 402)], cooldown_s=600, clock=Clock())
+    with pytest.raises(LLMError) as e:
+        _ask(llm)
+    assert e.value.status == 402
+    # all cooling down -> still tried (better a late answer than none)
+    with pytest.raises(LLMError):
+        _ask(llm)
+    assert all(c.calls == 2 for c in llm.clients)
+
+
+def test_conversation_continues_on_the_backup(store):
+    primary = FlakyLLM("gemini", 429)
+    agent = AdvisorAgent(CONFIG, store, FailoverLLM([primary, RuleBasedLLM(CONFIG)],
+                                                    cooldown_s=600, clock=Clock()),
+                         fallback_llm=None)
+    conv = agent.start_conversation().conversation_id
+    r = say(agent, conv, "שכר בסיס 16,000 ועמלות 3,000, אני מנהל אזור מכירות")
+    assert r.state.profile.base_salary == 16000
+    assert not r.llm_fallback and r.notice is None  # a real model answered, no notice
+    say(agent, conv, "פנסיה 6%")
+    assert primary.calls == 1  # benched after the first failure
+
+
+GEMINI_CALL = {"id": "c1", "type": "function",
+               "function": {"name": "update_profile", "arguments": "{}"},
+               "extra_content": {"google": {"thought_signature": "sig-from-gemini"}}}
+PLAIN_CALL = {"id": "c2", "type": "function",
+              "function": {"name": "update_profile", "arguments": "{}"}}
+
+
+def _sent(provider, *assistant_turns):
+    """What `provider` (model m) sends, given assistant turns as (origin, tool_calls)."""
+    llm = OpenAICompatibleLLM("m", "http://x", provider=provider)
+    msgs = [{"role": "user", "content": "x"}]
+    msgs += [{"role": "assistant", "content": None, "tool_calls": calls, ORIGIN_KEY: origin}
+             for origin, calls in assistant_turns]
+    return llm.request_body("s", msgs, [])["messages"][2:]
+
+
+def test_history_from_gemini_is_cleaned_for_another_provider():
+    [m] = _sent("groq", ("gemini:g", [GEMINI_CALL]))
+    [tc] = m["tool_calls"]
+    assert "extra_content" not in tc and tc["function"]["name"] == "update_profile"
+    assert ORIGIN_KEY not in m  # the tag never leaves the server
+
+
+def test_own_history_is_sent_back_untouched():
+    [m] = _sent("gemini", ("gemini:m", [GEMINI_CALL]))
+    assert m["tool_calls"] == [GEMINI_CALL] and ORIGIN_KEY not in m
+
+
+def test_gemini_gets_a_placeholder_signature_for_another_providers_calls():
+    [m] = _sent("gemini", ("groq:q", [PLAIN_CALL]))
+    assert m["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == \
+        GEMINI_FOREIGN_SIGNATURE
+
+
+def test_replies_are_tagged_with_their_origin():
+    fake = FakeChatCompletions([_text_response("שלום")])
+    llm = OpenAICompatibleLLM("g", "http://x", transport=fake, provider="gemini")
+    step = llm.step(system="s", messages=[{"role": "user", "content": "x"}], tools=[],
+                    state=ConversationState())
+    assert step.assistant_message[ORIGIN_KEY] == "gemini:g"
 
 
 class FakeChatCompletions:

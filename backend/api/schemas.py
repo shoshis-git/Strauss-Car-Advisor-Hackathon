@@ -1,7 +1,7 @@
 """Request / response models of the HTTP API."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -83,11 +83,26 @@ class PayslipField(BaseModel):
     evidence: str = Field(description="השורה מהתלוש (אחרי השחרה) שממנה נלקח הערך")
 
 
+class PayslipCheck(BaseModel):
+    ok: bool
+    text: str
+
+
 class PayslipExtractResponse(BaseModel):
     """Proposed values only - nothing is saved until the employee confirms them."""
     fields: list[PayslipField]
     not_found: list[str]
     rejected: list[str]
+    source: Optional[Literal["text", "image"]] = Field(
+        description="text = נקרא מהטקסט של ה-PDF ואומת מולו; image = נקרא מתמונת העמוד "
+                    "במודל ראייה (אין טקסט עצמאי - לכן checks); null = לא נקרא (unreadable)")
+    checks: list[PayslipCheck] = Field(
+        default_factory=list, description="בדיקות החשבון של התלוש עצמו (רק בקריאה מתמונה)")
+    unreadable: Optional[str] = Field(
+        None, description="אין בקובץ טקסט קריא - הסבר לעובד. אפשר לשלוח שוב עם ?vision=1 "
+                          "אחרי שהעובד הסכים לשלוח את תמונת התלוש למודל")
+    vision_available: bool = Field(
+        False, description="האם השרת מאפשר קריאה מתמונה (PAYSLIP_VISION ומודל שתומך בתמונות)")
 
 
 class PayslipValues(BaseModel):

@@ -41,6 +41,7 @@ export function useEmployeeSession() {
   const [notice, setNotice] = useState<string | null>(null);
   // values read from an uploaded payslip, waiting for the employee's confirmation
   const [payslip, setPayslip] = useState<PayslipExtraction | null>(null);
+  const payslipFile = useRef<File | null>(null);
   const activeId = useRef(sessionId);
 
   const adopt = useCallback((id: string | null) => {
@@ -137,8 +138,21 @@ export function useEmployeeSession() {
     (file: File) =>
       run(async () => {
         setPayslip(null);
+        payslipFile.current = null;
         if (!isPdf(file)) throw new ApiError(415, "אפשר להעלות רק תלוש שכר בפורמט PDF");
+        payslipFile.current = file; // kept only in this tab, for a consented re-read
         setPayslip(await api.extractPayslip(file));
+      }),
+    [run],
+  );
+
+  /** The text was unreadable and the employee agreed to send the page image to the model. */
+  const readPayslipImage = useCallback(
+    () =>
+      run(async () => {
+        const file = payslipFile.current;
+        if (!file) return;
+        setPayslip(await api.extractPayslip(file, true));
       }),
     [run],
   );
@@ -149,6 +163,7 @@ export function useEmployeeSession() {
       run(async () => {
         const r = await api.applyPayslip(activeId.current, values);
         setPayslip(null);
+        payslipFile.current = null;
         adopt(r.session_id);
         setNotice(r.notice ?? null);
         await refresh(r.session_id);
@@ -156,7 +171,10 @@ export function useEmployeeSession() {
     [run, adopt, refresh],
   );
 
-  const cancelPayslip = useCallback(() => setPayslip(null), []);
+  const cancelPayslip = useCallback(() => {
+    setPayslip(null);
+    payslipFile.current = null;
+  }, []);
 
   const reset = useCallback(() => {
     adopt(null);
@@ -165,6 +183,7 @@ export function useEmployeeSession() {
     setError(null);
     setNotice(null);
     setPayslip(null);
+    payslipFile.current = null;
   }, [adopt]);
 
   return {
@@ -180,6 +199,7 @@ export function useEmployeeSession() {
     setAlternative,
     reset,
     uploadPayslip,
+    readPayslipImage,
     confirmPayslip,
     cancelPayslip,
   };

@@ -6,6 +6,8 @@ interface Props {
   busy: boolean;
   onConfirm: (values: PayslipValues) => void;
   onCancel: () => void;
+  /** the employee agreed to send the page image of an unreadable PDF to the model */
+  onReadImage?: () => void;
 }
 
 const UNIT: Partial<Record<PayslipFieldName, string>> = {
@@ -23,9 +25,61 @@ interface Row {
   text: string;
 }
 
+/** An unreadable payslip asks for consent first; a read one shows its values for review. */
+export function PayslipReview(props: Props) {
+  if (props.extraction.unreadable) return <ImageConsent {...props} />;
+  // a re-read (text -> image) starts the review afresh
+  return <ReviewValues key={props.extraction.source ?? ""} {...props} />;
+}
+
+/** The PDF has no readable text: only its image can be read - and an image cannot be
+ *  redacted, so the employee decides. */
+function ImageConsent({ extraction, busy, onCancel, onReadImage }: Props) {
+  return (
+    <div className="border-t border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950" data-testid="payslip-consent">
+      <p className="font-semibold">⚠️ {extraction.unreadable}</p>
+      {extraction.vision_available && onReadImage ? (
+        <>
+          <p className="mt-1">
+            אפשר לשלוח <strong>תמונה של התלוש</strong> לקריאה במודל בינה מלאכותית (Gemini). התמונה כוללת את{" "}
+            <strong>כל</strong> פרטי התלוש, כולל ת״ז וחשבון בנק. הקובץ לא נשמר אצלנו, ולפני שמירה תוכלו לבדוק
+            ולאשר כל ערך.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onReadImage}
+              className="rounded-lg bg-amber-600 px-4 py-1.5 font-semibold text-white hover:bg-amber-700 disabled:opacity-40"
+            >
+              שליחה לקריאה
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onCancel}
+              className="rounded-lg border border-slate-300 bg-white px-4 py-1.5 hover:bg-slate-100"
+            >
+              ביטול – אמסור את הנתונים בצ׳אט
+            </button>
+          </div>
+        </>
+      ) : (
+        <button
+          type="button"
+          onClick={onCancel}
+          className="mt-3 rounded-lg border border-slate-300 bg-white px-4 py-1.5 hover:bg-slate-100"
+        >
+          סגירה – אמסור את הנתונים בצ׳אט
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Values read from the payslip, each beside the line it came from. The employee may
  *  correct or untick any of them; only what they confirm is saved. */
-export function PayslipReview({ extraction, busy, onConfirm, onCancel }: Props) {
+function ReviewValues({ extraction, busy, onConfirm, onCancel }: Props) {
   const [rows, setRows] = useState<Record<string, Row>>(() =>
     Object.fromEntries(extraction.fields.map((f) => [f.field, { include: true, text: String(f.value) }])),
   );
@@ -51,10 +105,33 @@ export function PayslipReview({ extraction, busy, onConfirm, onCancel }: Props) 
   return (
     <div className="border-t border-teal-200 bg-teal-50/60 px-4 py-3 text-sm" data-testid="payslip-review">
       <p className="font-semibold text-teal-900">📄 נתונים שזוהו בתלוש - בדקו ואשרו</p>
-      <p className="mt-0.5 text-xs text-teal-800">
-        פרטים מזהים (ת״ז, חשבון בנק, כתובת, טלפון) הושחרו לפני העיבוד, והקובץ עצמו לא נשמר. רק מה שתאשרו
-        יישמר.
-      </p>
+      {extraction.source === "image" ? (
+        <div className="mt-1 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950" data-testid="image-source">
+          <p className="font-semibold">
+            ⚠️ לא היה בקובץ טקסט קריא, ולכן התלוש נקרא מתמונה על ידי מודל בינה מלאכותית - בדקו היטב כל
+            ערך מול התלוש.
+          </p>
+          {extraction.checks.length > 0 && (
+            <ul className="mt-1 space-y-0.5">
+              {extraction.checks.map((c, i) => (
+                <li key={i} className={c.ok ? "text-emerald-800" : "font-semibold text-red-800"}>
+                  {c.ok ? "✓" : "✗"} <span className="num">{c.text}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {extraction.checks.some((c) => !c.ok) && (
+            <p className="mt-1 font-semibold text-red-800">
+              בדיקת החשבון של התלוש נכשלה - ייתכן שספרה נקראה לא נכון.
+            </p>
+          )}
+        </div>
+      ) : (
+        <p className="mt-0.5 text-xs text-teal-800">
+          פרטים מזהים (ת״ז, חשבון בנק, כתובת, טלפון) הושחרו לפני העיבוד, והקובץ עצמו לא נשמר. רק מה
+          שתאשרו יישמר.
+        </p>
+      )}
 
       {extraction.fields.length > 0 ? (
         <table className="mt-2 w-full">

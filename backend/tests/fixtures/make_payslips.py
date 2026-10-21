@@ -10,6 +10,9 @@ payslip_e004.pdf     - Hebrew stored in *visual* order, as many payroll systems 
 payslip_logical.pdf  - logical order; commission and bonus on separate lines, pension
                        given only as an amount (no %), plus an employer-pension line.
 payslip_scanned.pdf  - no text layer at all (like a scan / photo).
+payslip_glyph_codes.pdf - a text layer of font glyph codes instead of characters, as some
+                       payroll systems emit (a real payslip read '#446$$' for 355.00 and
+                       '789:;<=' for 'שכר יסוד').
 """
 from __future__ import annotations
 
@@ -84,6 +87,11 @@ def main() -> None:
     pdfmetrics.registerFont(TTFont("Heb", FONT))
     write(HERE / "payslip_e004.pdf", E004, visual)
     write(HERE / "payslip_logical.pdf", LOGICAL)
+    write(HERE / "payslip_glyph_codes.pdf", [
+        '!"#$%&#&\' ()*+*,', "#446$$ \"46$$ &655 789:;<=",
+        "'6$$ ..6$$ :>:?@;8AB:CDEFF8G=", "$ ..6$$ :>:?@;8AB:CDEF:@:",
+        "'46$$ #\"$6$$ <LM9 '46$$", "F8C:;>:@7 :@8CNO8?:> 0ST/UTV/VW",
+    ])
     c = canvas.Canvas(str(HERE / "payslip_scanned.pdf"), pagesize=A4)
     c.rect(50, 50, 500, 700)  # a "scan": shapes only, no text layer
     c.save()
