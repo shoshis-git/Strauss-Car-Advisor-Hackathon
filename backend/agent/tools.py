@@ -2,13 +2,14 @@
 and returns a JSON-serialisable dict; all numbers come from the deterministic engine."""
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any, Callable, Optional
 
 from ..data_loader.config_loader import AppConfig, Car, Employee
-from ..engine.comparator import compare
+from ..engine.comparator import compare, display_round
 from ..engine.eligibility import AlternativeRequest, check_eligibility, tax_value_of_use
-from .state import FIELD_LABELS, ConversationState, compute_missing
+from .state import FIELD_LABELS, ConversationState, compute_missing, is_blocked
 
 WAIVER = "waiver"
 
@@ -24,18 +25,37 @@ def occupation_variants(name: str) -> list[str]:
     return list(dict.fromkeys([name, " ".join(masc), " ".join(fem)]))
 
 
-def resolve_occupation(config: AppConfig, text: str) -> Optional[str]:
-    """Longest occupation (any gender form) mentioned in text."""
+FUZZY_OCCUPATION_CUTOFF = 0.85  # 'נציג מבירות שטח' (typo) -> 'נציג/ת מכירות שטח'
+
+
+def resolve_occupation(config: AppConfig, text: str, fuzzy: bool = False) -> Optional[str]:
+    """Longest occupation (any gender form) mentioned in text.
+
+    fuzzy=True (for a tool argument that should *be* an occupation): if nothing matches
+    literally, accept a near-identical spelling - but only when exactly one occupation
+    is that close, so a typo is fixed and an unknown job is still rejected."""
     best: Optional[tuple[int, str]] = None
     for occ in config.occupations:
         for v in occupation_variants(occ.name):
             if v in text and (best is None or len(v) > best[0]):
                 best = (len(v), occ.name)
-    return best[1] if best else None
+    if best or not fuzzy:
+        return best[1] if best else None
+    t = " ".join(text.split())
+    close = {occ.name for occ in config.occupations for v in occupation_variants(occ.name)
+             if difflib.SequenceMatcher(None, t, v).ratio() >= FUZZY_OCCUPATION_CUTOFF}
+    return close.pop() if len(close) == 1 else None
+
+
+def _norm_tokens(text: str) -> list[str]:
+    return [w for w in re.split(r"[\s\-_/,.()]+", text.casefold()) if w]
 
 
 def resolve_car(config: AppConfig, text: str) -> Optional[Car]:
-    """Strict: car id ('CAR-10'), exact model name or exact alias. No partial matches."""
+    """Car id ('CAR-10'), exact model name/alias - or one unambiguous catalogue car whose
+    name is accompanied only by brand words / its registration year ('BYD Seal',
+    'טויוטה קורולה', 'SEAL 2025'). Anything else ('קורולה 2030', 'Model Y') is not
+    guessed."""
     t = " ".join(text.split())
     m = re.fullmatch(r"(?i)car-?(\d{1,2})", t)
     if m:
@@ -46,16 +66,29 @@ def resolve_car(config: AppConfig, text: str) -> Optional[Car]:
     for car in config.cars:
         if any(n.casefold() == t.casefold() for n in config.car_names(car)):
             return car
-    return None
+
+    found = find_cars_in_text(config, t)
+    if len({c.car_id for _, c in found}) != 1:
+        return None
+    car = found[0][1]
+    rest = t.casefold()
+    for name in sorted(config.car_names(car), key=len, reverse=True):
+        rest = re.sub(r"(?<![\w'׳])[ומלבהשכ]{0,3}-?" + re.escape(name.casefold()) + r"(?![\w'׳])",
+                      " ", rest)
+    for brand in sorted(config.car_brand_words, key=len, reverse=True):
+        rest = re.sub(r"(?<![\w'׳])" + re.escape(brand.casefold()) + r"(?![\w'׳])", " ", rest)
+    leftover = [w for w in _norm_tokens(rest) if w != str(car.registration_year)]
+    return car if not leftover else None
 
 
 def car_not_found_error(config: AppConfig, field: str, raw: str) -> str:
-    """Rejection message; names catalogue cars mentioned inside the text as suggestions."""
+    """Rejection message; names catalogue cars mentioned inside the text as candidates."""
     msg = f"{field}: הרכב {raw!r} לא נמצא בקטלוג"
     hints = list(dict.fromkeys(f"{c.model_name} ({c.car_id})"
                                for _, c in find_cars_in_text(config, raw)))
     if hints:
-        msg += f" - האם הכוונה ל-{' / '.join(hints)}? יש לאשר מול העובד"
+        msg += (f" - דגמים קרובים בקטלוג: {' / '.join(hints)}. "
+                "אם העובד אכן התכוון לאחד מהם - שמור אותו לפי הקוד")
     return msg
 
 
@@ -125,6 +158,10 @@ def _car_summary(car: Car) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Tools
 # --------------------------------------------------------------------------- #
+NEW_CASE_WARNING = ("זוהה עובד/תרחיש חדש (עיסוק שונה מהקודם): כל נתוני התרחיש הקודם אופסו. "
+                    "שמור רק את מה שנאמר בהודעה הנוכחית ובקש מחדש את כל השאר - "
+                    "אל תשתמש בערכים מהשיחה הקודמת.")
+
 NUMERIC_FIELDS = {
     "base_salary": ("profile", float), "commissions_bonuses": ("profile", float),
     "pension_pct": ("profile", float), "hishtalmut_pct": ("profile", float),
@@ -139,10 +176,23 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
     updated: dict[str, Any] = {}
     errors: list[str] = []
     warnings: list[str] = []
+
+    # A different occupation than the one on file = another employee / scenario in the
+    # same chat: nothing of the previous case may leak into it (pension, credit points,
+    # the previous car's participation...).
+    if fields.get("occupation") and state.profile.occupation:
+        occ = resolve_occupation(config, str(fields["occupation"]), fuzzy=True)
+        if occ is not None and occ != state.profile.occupation:
+            state.reset_case()
+            warnings.append(NEW_CASE_WARNING)
     p, cur, tgt = state.profile, state.current, state.target
 
     for name, (section, typ) in NUMERIC_FIELDS.items():
         if fields.get(name) is None:
+            continue
+        if name == state.participation_unknown:
+            errors.append(f"{name}: העובד ציין שאינו יודע את ההשתתפות - הערך נקבע רק "
+                          "בתשובת נציג/ה (ask_representative), לא בניחוש ולא מברירת המחדל")
             continue
         try:
             value = typ(fields[name])
@@ -155,23 +205,29 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
         setattr(getattr(state, section), name, value)
         updated[name] = value
 
+    # The employee's group comes from their occupation (occupations table) whenever the
+    # occupation is known; a different group - typically the *car's* group - is rejected.
     if fields.get("occupation"):
-        occ = resolve_occupation(config, str(fields["occupation"]))
+        occ = resolve_occupation(config, str(fields["occupation"]), fuzzy=True)
         if occ is None:
-            errors.append(f"occupation: העיסוק {fields['occupation']!r} לא נמצא בטבלת העיסוקים")
+            errors.append(f"occupation: העיסוק {fields['occupation']!r} לא נמצא בטבלת העיסוקים "
+                          f"(קיימים: {', '.join(o.name for o in config.occupations)})")
         else:
             p.occupation = updated["occupation"] = occ
             occ_group = config.occupation(occ).eligibility_group
-            if p.eligibility_group is None and not fields.get("eligibility_group"):
+            if p.eligibility_group != occ_group:
                 p.eligibility_group = updated["eligibility_group"] = occ_group
-            elif (fields.get("eligibility_group") or p.eligibility_group) != occ_group:
-                warnings.append(f"לפי טבלת העיסוקים, קבוצת הזכאות של '{occ}' היא {occ_group}")
 
     if fields.get("eligibility_group"):
         g = str(fields["eligibility_group"]).strip().rstrip("'׳")
         if g not in config.rules.group_order:
             errors.append(f"eligibility_group: קבוצה לא קיימת {g!r} "
                           f"(קיימות: {', '.join(config.rules.group_order)})")
+        elif p.occupation and g != config.occupation(p.occupation).eligibility_group:
+            occ_group = config.occupation(p.occupation).eligibility_group
+            errors.append(f"eligibility_group: לא עודכן - קבוצת הזכאות של העובד נקבעת לפי "
+                          f"העיסוק '{p.occupation}' והיא {occ_group}. "
+                          f"(קבוצה {g} היא אולי קבוצת הרכב, לא של העובד)")
         else:
             p.eligibility_group = updated["eligibility_group"] = g
 
@@ -186,6 +242,11 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
             if car is None:
                 errors.append(car_not_found_error(config, "current_car", raw))
             else:
+                if cur.current_car_code != car.car_id:
+                    # a participation belongs to one car: never carry it to another one
+                    if "current_participation" not in updated:
+                        cur.current_participation = None
+                    cur.current_maintenance = None
                 cur.status, cur.current_car_code = "car", car.car_id
                 updated["current_car"] = car.car_id
 
@@ -196,20 +257,23 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
         else:
             tgt.target_action = updated["target_action"] = action
             if action == WAIVER:
-                tgt.target_car_code = None
+                tgt.target_car_code, tgt.target_participation = None, None
 
     if fields.get("target_car"):
         car = resolve_car(config, str(fields["target_car"]))
         if car is None:
             errors.append(car_not_found_error(config, "target_car", str(fields["target_car"])))
         else:
+            if tgt.target_car_code != car.car_id and "target_participation" not in updated:
+                tgt.target_participation = None  # a rep-approved amount belongs to one car
             tgt.target_action, tgt.target_car_code = "replace", car.car_id
             updated["target_car"] = car.car_id
 
     if updated:
         state.last_comparison = None  # inputs changed -> previous result is stale
+    state.precheck = eligibility_precheck(state, config)
     state.missing_info = compute_missing(state, config)
-    return {
+    result = {
         "ok": not errors,
         "updated": updated,
         "errors": errors,
@@ -217,6 +281,66 @@ def update_profile(state: ConversationState, config: AppConfig, **fields: Any) -
         "missing_info": state.missing_info,
         "missing_labels": [FIELD_LABELS[f] for f in state.missing_info],
     }
+    if state.precheck is not None:
+        result["eligibility"] = state.precheck
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Fail-fast eligibility
+# --------------------------------------------------------------------------- #
+MAX_ALTERNATIVES = 4
+
+
+def suggest_alternatives(state: ConversationState, config: AppConfig,
+                         like: Optional[Car] = None) -> list[dict[str, Any]]:
+    """Permitted cars, closest to what was asked first: same drive as `like`, then the
+    highest permitted group, then lower value of use."""
+    emp = build_employee(state, config)
+    ranks = {g: i for i, g in enumerate(config.rules.group_order)}
+    allowed = [c for c in config.cars
+               if c.car_id not in config.rules.family_track.cars
+               and c.car_id != state.current.current_car_code
+               and check_eligibility(config, emp, AlternativeRequest.car(c.car_id)).is_eligible]
+    allowed.sort(key=lambda c: (like is not None and c.drive != like.drive,
+                                -ranks.get(c.group, 0), tax_value_of_use(c)))
+    return [_car_summary(c) for c in allowed[:MAX_ALTERNATIVES]]
+
+
+def eligibility_precheck(state: ConversationState, config: AppConfig) -> Optional[dict]:
+    """Is the requested alternative possible? Decided as soon as the request and the
+    occupation/group are known (no salary needed); None = cannot be decided yet."""
+    p, tgt = state.profile, state.target
+    emp = build_employee(state, config)
+    if tgt.target_action == WAIVER:
+        if not p.occupation:
+            return None
+        res = check_eligibility(config, emp, AlternativeRequest.waiver())
+        requested, like = "ויתור על הרכב", None
+    elif tgt.target_action == "replace" and tgt.target_car_code and p.eligibility_group:
+        like = config.car(tgt.target_car_code)
+        if like.car_id in config.rules.family_track.cars and p.children_count is None:
+            return None  # family track depends on the number of children
+        res = check_eligibility(config, emp, AlternativeRequest.car(like.car_id))
+        requested = f"{like.model_name} ({like.car_id}, קבוצה {like.group})"
+    else:
+        return None
+    out: dict[str, Any] = {"eligible": res.is_eligible, "requested": requested,
+                           "reason": res.reason}
+    if res.is_eligible and like is not None and like.car_id in config.rules.family_track.cars:
+        # engine-computed family-track figures, so the model never does this arithmetic
+        out["family_track"] = {
+            "company_monthly_cost": like.company_monthly_cost,
+            "group_budget": config.rules.budget(p.eligibility_group),
+            "gap_above_budget": res.scenario.family_gap,
+            "employee_share_monthly_net_deduction": res.scenario.family_gap_deduction,
+            "plus_regular_participation": res.scenario.participation,
+        }
+    if not res.is_eligible:
+        out["alternatives"] = suggest_alternatives(state, config, like)
+        out["instruction"] = ("הבקשה אינה אפשרית: אל תמשיך לאסוף נתוני שכר. הסבר לעובד את "
+                              "הסיבה והצע את החלופות המותרות.")
+    return out
 
 
 def get_allowed_cars(state: ConversationState, config: AppConfig) -> dict:
@@ -253,11 +377,16 @@ def get_allowed_cars(state: ConversationState, config: AppConfig) -> dict:
 
 
 def calculate_comparison(state: ConversationState, config: AppConfig) -> dict:
-    """Run the deterministic comparator - only when every required field is known."""
+    """Run the deterministic comparator - only when every required field is known.
+    (A blocked request with complete data still gets a result: today's net + the reason.)"""
     state.missing_info = compute_missing(state, config)
-    if state.missing_info:
-        return {"ok": False, "missing_info": state.missing_info,
-                "missing_labels": [FIELD_LABELS[f] for f in state.missing_info]}
+    gaps = compute_missing(state, config, ignore_block=True)
+    if gaps:
+        result: dict[str, Any] = {"ok": False, "missing_info": gaps,
+                                  "missing_labels": [FIELD_LABELS[f] for f in gaps]}
+        if is_blocked(state):
+            result["eligibility"] = state.precheck
+        return result
     tgt = state.target
     request = (AlternativeRequest.waiver() if tgt.target_action == WAIVER
                else AlternativeRequest.car(tgt.target_car_code))
@@ -279,9 +408,44 @@ def calculate_comparison(state: ConversationState, config: AppConfig) -> dict:
         "electric_gross": c.electric_gross,
         "family_gap_deduction": c.family_gap_deduction,
         "explanation": c.explanation,
+        # where the alternative's participation comes from - say so to the employee
+        "alternative_participation_source": (
+            None if tgt.target_action == WAIVER
+            else "approved_by_representative" if tgt.target_participation is not None
+            else "company_catalogue_default"),
+        # line-by-line breakdown of both sides (display values, whole shekels)
+        "today": _side_breakdown(c.today, config),
+        "alternative": _side_breakdown(c.alternative, config) if c.alternative else None,
     }
     state.last_comparison = result
     return result
+
+
+def _side_breakdown(res, config: AppConfig) -> dict[str, Any]:
+    sc, slip = res.scenario, res.payslip
+    r = lambda v: display_round(v, config.rules)  # noqa: E731
+    return {
+        "label": sc.label,
+        "kind": sc.kind,
+        "car_id": sc.car_id,
+        "is_electric": sc.is_electric,
+        "value_of_use": r(sc.value_of_use),
+        "participation": r(sc.participation),
+        "maintenance_allowance": r(sc.maintenance_allowance),
+        "electric_gross": r(res.electric_gross),
+        "family_gap_deduction": r(sc.family_gap_deduction),
+        "income_tax": r(slip.income_tax),
+        "btl_health": r(slip.btl_and_health),
+        "net": r(slip.net),
+    }
+
+
+def start_new_case(state: ConversationState, config: AppConfig) -> dict:
+    """The employee moves to a new question about another employee / scenario."""
+    state.reset_case()
+    state.missing_info = compute_missing(state, config)
+    return {"ok": True, "status": "new_case", "note": NEW_CASE_WARNING,
+            "missing_labels": [FIELD_LABELS[f] for f in state.missing_info]}
 
 
 def ask_representative(state: ConversationState, config: AppConfig,
@@ -301,6 +465,7 @@ TOOLS: dict[str, Callable[..., dict]] = {
     "get_allowed_cars": get_allowed_cars,
     "calculate_comparison": calculate_comparison,
     "ask_representative": ask_representative,
+    "start_new_case": start_new_case,
 }
 
 _num = {"type": "number"}
@@ -309,14 +474,19 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "update_profile",
         "description": (
             "שמירת נתונים שהעובד מסר במפורש בשיחה. יש להעביר רק שדות שהעובד אמר - "
-            "לעולם לא לנחש. רכב אפשר לציין בקוד (CAR-10), בשם הדגם מהקטלוג או בכינוי "
-            "עברי נפוץ (למשל 'אטו 3'); רכב שלא בקטלוג יידחה. "
-            "current_car='waiver' אם אין לעובד רכב והוא מקבל אחזקה."
+            "לעולם לא לנחש. רכב אפשר לציין בקוד (CAR-10), בשם הדגם כפי שהעובד כתב "
+            "(למשל 'BYD Seal' או 'אטו 3'); אם הרכב נשמר (מופיע ב-updated) - אין צורך לבקש "
+            "אישור מהעובד. רכב שלא בקטלוג יידחה. "
+            "current_car='waiver' אם אין לעובד רכב והוא מקבל אחזקה. "
+            "התוצאה כוללת eligibility כשאפשר כבר לדעת אם הבקשה אפשרית."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "eligibility_group": {"type": "string", "description": "קבוצת זכאות: א/ב/ג/ד"},
+                "eligibility_group": {
+                    "type": "string",
+                    "description": "קבוצת הזכאות של העובד (א/ב/ג/ד) - רק אם העובד ציין אותה. "
+                                   "לעולם לא קבוצת הרכב. אם העיסוק ידוע הקבוצה נקבעת ממנו."},
                 "occupation": {"type": "string", "description": "העיסוק כפי שנאמר"},
                 "base_salary": _num,
                 "commissions_bonuses": {**_num, "description": "סך עמלות ובונוסים חודשי"},
@@ -347,8 +517,9 @@ TOOL_SPECS: list[dict[str, Any]] = [
     {
         "name": "ask_representative",
         "description": (
-            "העברת שאלה לנציג/ת שכר כשחסר נתון שהעובד לא אמור לדעת "
-            "(למשל השתתפות חריגה ברכב מסוים). השיחה מוקפאת עד לתשובה."
+            "העברת שאלה לנציג/ת שכר כשחסר נתון שהעובד לא אמור לדעת או אינו יודע "
+            "(למשל השתתפות חריגה ברכב מסוים, או 'אין לי מושג כמה ההשתתפות'). "
+            "השיחה מוקפאת עד לתשובה."
         ),
         "input_schema": {
             "type": "object",
@@ -359,6 +530,15 @@ TOOL_SPECS: list[dict[str, Any]] = [
             },
             "required": ["question"],
         },
+    },
+    {
+        "name": "start_new_case",
+        "description": (
+            "פתיחת תרחיש חדש באותה שיחה: העובד שואל על עובד אחר / מצב אחר ולא ממשיך את "
+            "הקודם. מאפס את כל הנתונים (שכר, הפרשות, נקודות זיכוי, רכבים, השתתפויות). "
+            "להפעיל לפני update_profile של התרחיש החדש."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
     },
 ]
 
