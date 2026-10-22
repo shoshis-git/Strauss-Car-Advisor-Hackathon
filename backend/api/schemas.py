@@ -26,6 +26,8 @@ class StateView(BaseModel):
     rep_question: Optional[str]
     last_comparison: Optional[dict[str, Any]]
     precheck: Optional[dict[str, Any]] = None
+    today_preview: Optional[dict[str, Any]] = Field(
+        None, description="בזמן המתנה לנציג: הנטו היום (מהמנוע); החלופה תגיע עם התשובה")
 
     @classmethod
     def of(cls, s: ConversationState) -> "StateView":
@@ -35,6 +37,7 @@ class StateView(BaseModel):
                    missing_labels=[FIELD_LABELS[f] for f in s.missing_info],
                    waiting_for_rep=s.waiting_for_rep, rep_question=s.rep_question,
                    last_comparison=s.last_comparison,
+                   today_preview=s.today_preview if s.waiting_for_rep else None,
                    precheck=({k: v for k, v in s.precheck.items() if k not in _PRECHECK_INTERNAL}
                              if s.precheck else None))
 

@@ -42,8 +42,21 @@ REP_NUMERIC_FIELDS = ("target_participation", "current_participation")
 FALLBACK_NOTICE = ("מודל השפה אינו זמין כרגע (מכסה או תקלה זמנית), ולכן התשובה נוצרה במצב "
                    "הדטרמיניסטי. החישובים עצמם זהים - הם תמיד מתבצעים במנוע הקבוע.")
 
+MEANTIME_NOTE = ("\nבינתיים, הנטו שלך היום ({label}): {net} ₪ בחודש. "
+                 "החלופה{alt} תתעדכן כשתגיע תשובה.")
+
 log = logging.getLogger("strauss.agent")
 _DEFAULT = object()
+
+
+def _meantime(state: ConversationState) -> str:
+    """While waiting for the rep: 'in the meantime, here is today' (engine numbers)."""
+    p = state.today_preview
+    if not p:
+        return ""
+    alt = f" ({p['alternative_label']})" if p.get("alternative_label") else ""
+    return MEANTIME_NOTE.format(label=p["today"]["label"], net=fmt_ils(p["today"]["net"]),
+                                alt=alt)
 
 
 @dataclass
@@ -104,7 +117,7 @@ class AdvisorAgent:
         state = self.store.load(conversation_id)
         state.add_message("employee", text)
         if state.waiting_for_rep:
-            reply = FROZEN_REPLY.format(q=state.rep_question)
+            reply = FROZEN_REPLY.format(q=state.rep_question) + _meantime(state)
             state.add_message("assistant", reply)
             self.store.save(state)
             return AgentReply(reply, state, [], frozen=True)
@@ -130,6 +143,7 @@ class AdvisorAgent:
             if state.participation_unknown == state.rep_field:
                 state.participation_unknown = None  # the official value has arrived
         state.waiting_for_rep, state.rep_question, state.rep_field = False, None, None
+        state.today_preview = None  # the full comparison follows
         state.missing_info = compute_missing(state, self.config)
         return self._run_turn(state)
 
@@ -342,7 +356,7 @@ class AdvisorAgent:
                 state.add_message("tool", payload, tool_name=call.name, tool_input=call.input)
                 transcript.append({"role": "tool", "tool_call_id": call.id, "content": payload})
             if state.waiting_for_rep:
-                reply = HANDOFF_REPLY.format(q=state.rep_question)
+                reply = HANDOFF_REPLY.format(q=state.rep_question) + _meantime(state)
                 break
             if state.case_start != case_start:
                 # new case: the model continues from the new case's messages only, so
@@ -350,7 +364,9 @@ class AdvisorAgent:
                 transcript = llm_transcript(state)
         if reply is None:
             reply = "מצטער/ת, לא הצלחתי להשלים את הבקשה. אפשר לנסח שוב?"
-        reply = self._escalate_unknown_participation(state, called) or reply
+        escalated = self._escalate_unknown_participation(state, called)
+        if escalated:
+            reply = escalated + _meantime(state)
 
         state.add_message("assistant", reply)
         self.store.save(state)

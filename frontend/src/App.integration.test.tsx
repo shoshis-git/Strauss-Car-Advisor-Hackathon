@@ -211,6 +211,10 @@ describe.skipIf(!health)("App ↔ backend", () => {
       await send("היום יש לי טוסון עם השתתפות 400");
       await send("אני רוצה לעבור ל-EV3 אבל סוכמה לי השתתפות מיוחדת ואני לא יודע כמה");
       await screen.findByText("⏳ ממתינים לתשובת נציג/ת שכר ותחבורה", {}, T);
+      // in the meantime: today's net, the alternative waits for the answer
+      expect((await screen.findByTestId("net-today", {}, T)).textContent).toContain("10,693 ₪");
+      expect(screen.getByTestId("waiting-for-rep").textContent).toContain("EV3");
+      expect(screen.queryByTestId("net-diff")).toBeNull();
 
       fireEvent.click(screen.getByRole("tab", { name: /מסך נציג/ }));
       // the rep screen is locked: a wrong key is refused, the right one opens it

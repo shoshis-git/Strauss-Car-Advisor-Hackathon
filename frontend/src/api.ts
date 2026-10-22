@@ -35,6 +35,8 @@ export interface Comparison {
   electric_gross: number | null;
   family_gap_deduction: number | null;
   explanation: string;
+  /** where the new car's participation comes from (null for a waiver) */
+  alternative_participation_source?: "company_catalogue_default" | "approved_by_representative" | null;
   today: Side;
   alternative: Side | null;
 }
@@ -71,6 +73,8 @@ export interface StateView {
   last_comparison: Comparison | null;
   /** fail-fast eligibility of the request, known before any salary data */
   precheck?: Precheck | null;
+  /** while waiting for the representative: today's net; the alternative follows the answer */
+  today_preview?: { today: Side; alternative_label: string | null } | null;
 }
 
 export interface Precheck {
