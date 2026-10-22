@@ -107,9 +107,21 @@ _UNKNOWN_WORDS = (r"(לא\s*(?:יודע|יודעת|ידוע|בטוח|בטוחה|
 _TARGET_WORDS = r"(חדש|החדש|אעבור|לעבור|המבוקש|שאקח|אקח|לקחת|מיוחדת|חריגה)"
 
 
+# "a different amount was agreed for me" - the answer to the catalogue-default note
+_AGREED_OTHERWISE = r"(סוכם|סוכמה|סיכמו|הסכם|שונה|אחרת|אחר\s*אצלי)"
+
+
 def participation_unknown_field(text: str, state: "ConversationState") -> Optional[str]:
     """Which participation the employee says they do not know (None = they did not)."""
-    if not (re.search(_PARTICIPATION_WORDS, text) and re.search(_UNKNOWN_WORDS, text)):
+    if not re.search(_UNKNOWN_WORDS, text):
+        return None
+    c = state.last_comparison
+    if (c and c.get("alternative_participation_source") == "company_catalogue_default"
+            and re.search(_AGREED_OTHERWISE, text)):
+        # the advisor just used the catalogue participation and invited a correction:
+        # "it was agreed differently for me, I don't know how much" -> the rep decides
+        return "target_participation"
+    if not re.search(_PARTICIPATION_WORDS, text):
         return None
     if re.search(_TARGET_WORDS, text) or state.current.current_participation is not None:
         return "target_participation"

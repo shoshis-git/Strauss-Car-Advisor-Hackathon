@@ -54,6 +54,12 @@ function moneyImpact(d: number): Impact {
   return d > 0 ? { text: `▲ ${ils(d)}`, dir: "up" } : { text: `▼ ${ils(-d)}`, dir: "down" };
 }
 
+/** say where the new car's participation comes from - a documented value, never a guess */
+const PARTICIPATION_SOURCE: Record<string, string | undefined> = {
+  company_catalogue_default: "בחלופה: לפי קטלוג הרכבים של החברה. סוכם אחרת? כתבו ביועץ",
+  approved_by_representative: "בחלופה: אושר על ידי נציג/ת שכר",
+};
+
 export function buildRows(c: Comparison): Row[] {
   const t: Side = c.today;
   const a: Side | null = c.alternative;
@@ -77,6 +83,7 @@ export function buildRows(c: Comparison): Row[] {
       label: "דמי השתתפות עובד",
       today: ils(t.participation),
       alt: v((s) => s.participation),
+      note: PARTICIPATION_SOURCE[c.alternative_participation_source ?? ""],
       impact: imp((s) => t.participation - s.participation),
     },
   ];
