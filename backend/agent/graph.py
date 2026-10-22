@@ -133,18 +133,8 @@ class AdvisorAgent:
         state.missing_info = compute_missing(state, self.config)
         return self._run_turn(state)
 
-    def load_demo_employee(self, conversation_id: str, employee_id: str) -> AgentReply:
-        """Fill the state from a sample employee and compute their original question.
-
-        Deterministic (no LLM): profile and current car come from the sample sheet,
-        the requested alternative is parsed from the employee's own question."""
-        from .rule_based import extract_fields  # deterministic Hebrew parser
-
-        emp = self.config.employee(employee_id)  # KeyError if unknown
-        try:
-            state = self.store.load(conversation_id)
-        except KeyError:
-            state = ConversationState(conversation_id=conversation_id)
+    def _fill_from_employee(self, state: ConversationState, emp) -> None:
+        """Profile and today's situation from the employee record (sample sheet / HR)."""
         state.display_name = f"{emp.name} ({emp.employee_id})"
         state.profile = EmployeeProfile(
             eligibility_group=emp.group, occupation=emp.occupation,
@@ -161,6 +151,52 @@ class AdvisorAgent:
         state.target = TargetChoice()
         state.last_comparison = None
         state.waiting_for_rep, state.rep_question, state.rep_field = False, None, None
+        state.precheck = None
+        state.missing_info = compute_missing(state, self.config)
+
+    def start_employee_session(self, employee_id: str) -> AgentReply:
+        """A NEW conversation for an identified employee: their record is loaded up front,
+        so the advisor opens personally and only the requested alternative is still asked.
+        Deterministic greeting (no LLM call)."""
+        emp = self.config.employee(employee_id)  # KeyError if unknown
+        state = ConversationState()
+        self._fill_from_employee(state, emp)
+        p, cur = state.profile, state.current
+        if cur.status == "car":
+            car = self.config.car(cur.current_car_code)
+            today = (f"רכב החברה שלך היום: {car.model_name} ({car.registration_year}), "
+                     f"השתתפות {fmt_ils(cur.current_participation)} ₪ בחודש")
+        else:
+            today = (f"היום אין לך רכב חברה ואת/ה מקבל/ת אחזקת רכב של "
+                     f"{fmt_ils(cur.current_maintenance or 0)} ₪")
+        pay = [f"שכר בסיס {fmt_ils(p.base_salary)} ₪"]
+        if p.commissions_bonuses:
+            pay.append(f"עמלות ובונוסים {fmt_ils(p.commissions_bonuses)} ₪")
+        pay += [f"פנסיה {p.pension_pct:g}%", f"קרן השתלמות {p.hishtalmut_pct:g}%",
+                f"{p.credit_points:g} נקודות זיכוי"]
+        first_name = emp.name.split()[0]
+        reply = (f"שלום {first_name}! זיהיתי אותך כ{p.occupation} (קבוצת זכאות {p.eligibility_group}).\n"
+                 f"טענתי מהמערכת את נתוני השכר שלך: {', '.join(pay)}.\n"
+                 f"{today}.\n"
+                 "מה תרצה/י לבדוק? למשל מעבר לרכב חשמלי, רכב אחר מהקטלוג או ויתור על הרכב. "
+                 "אם משהו מהנתונים השתנה - כתוב/כתבי לי ואעדכן.")
+        state.add_message("assistant", reply)
+        self.store.save(state)
+        return AgentReply(reply, state, [])
+
+    def load_demo_employee(self, conversation_id: str, employee_id: str) -> AgentReply:
+        """Fill the state from a sample employee and compute their original question.
+
+        Deterministic (no LLM): profile and current car come from the sample sheet,
+        the requested alternative is parsed from the employee's own question."""
+        from .rule_based import extract_fields  # deterministic Hebrew parser
+
+        emp = self.config.employee(employee_id)  # KeyError if unknown
+        try:
+            state = self.store.load(conversation_id)
+        except KeyError:
+            state = ConversationState(conversation_id=conversation_id)
+        self._fill_from_employee(state, emp)
 
         state.add_message("employee", emp.question)
         target = {k: v for k, v in extract_fields(emp.question, state, self.config).items()

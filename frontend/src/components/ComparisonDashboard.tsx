@@ -1,11 +1,14 @@
-import type { CarSummary, Comparison, Options, Side, StateView } from "../api";
+import type { CarSummary, Comparison, Options, Ranking, Side, StateView } from "../api";
 import { ils, num, signedIls, trend, type Trend } from "../format";
+import { AllOptions } from "./AllOptions";
 
 interface Props {
   state: StateView | null;
   options: Options | null;
   busy: boolean;
   onSwitch: (choice: { car_id: string } | { waiver: true }) => void;
+  /** all my options (every permitted alternative, ranked) - optional */
+  ranking?: Ranking | null;
 }
 
 const TREND_TEXT: Record<Trend, string> = {
@@ -501,6 +504,13 @@ export function ComparisonDashboard(props: Props) {
           ההשוואה תופיע ברגע שיהיו כל הנתונים וחלופה מבוקשת.
         </div>
       )}
+
+      <AllOptions
+        ranking={props.ranking ?? null}
+        busy={props.busy}
+        locked={state.waiting_for_rep}
+        onSwitch={props.onSwitch}
+      />
 
       <div className="grid grid-cols-1 items-start gap-5 md:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)]">
         <ProfileSummary state={state} />

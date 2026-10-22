@@ -163,6 +163,43 @@ export interface Options {
   waiver: { allowed: boolean | null; reason: string; maintenance?: number };
 }
 
+export interface RankedOption {
+  rank: number;
+  kind: "car" | "waiver";
+  car_id: string | null;
+  label: string;
+  model_name: string;
+  group: string | null;
+  drive: string | null;
+  family_track: boolean;
+  is_electric: boolean;
+  company_monthly_cost: number | null;
+  value_of_use: number;
+  participation: number;
+  maintenance_allowance: number;
+  family_gap_deduction: number;
+  net_alt: number;
+  net_diff: number;
+  explanation: string;
+  is_selected: boolean;
+}
+
+/** All my options: every permitted alternative, best net first (engine only). */
+export interface Ranking {
+  ok: boolean;
+  missing_labels?: string[];
+  error?: string;
+  current_label?: string;
+  net_today?: number;
+  group?: string;
+  budget?: number;
+  count?: number;
+  best?: RankedOption | null;
+  best_electric?: RankedOption | null;
+  options?: RankedOption[];
+  notes?: string[];
+}
+
 export interface DemoEmployee {
   employee_id: string;
   name: string;
@@ -245,7 +282,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     });
   } catch {
-    throw new ApiError(0, `השרת אינו זמין (${API_BASE}). האם ה-backend רץ?`);
+    throw new ApiError(
+      0,
+      import.meta.env.DEV
+        ? `השרת אינו זמין (${API_BASE}). האם ה-backend רץ?`
+        : "השרת אינו זמין כרגע. בדקו את החיבור לאינטרנט ונסו שוב בעוד רגע.",
+    );
   }
   if (!res.ok) {
     let detail = res.statusText;
@@ -286,6 +328,7 @@ export const api = {
   /** always a NEW conversation with a server-generated id */
   loadDemo: (empId: string) => post<ChatResponse>(`/api/demo/${empId}`),
   options: (id: string) => request<Options>(`/api/session/${id}/options`),
+  ranking: (id: string) => request<Ranking>(`/api/session/${id}/ranking`),
   setAlternative: (id: string, choice: { car_id: string } | { waiver: true }) =>
     post<ChatResponse>(`/api/session/${id}/alternative`, choice),
   /** the PDF itself is the body; the server reads it in memory and keeps nothing */

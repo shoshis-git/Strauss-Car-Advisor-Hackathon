@@ -210,6 +210,14 @@ def session_options(request: Request, session_id: str = SessionId) -> dict[str, 
     return get_allowed_cars(_load(_agent(request), session_id), _config(request))
 
 
+@router.get("/session/{session_id}/ranking")
+def session_ranking(request: Request, session_id: str = SessionId) -> dict[str, Any]:
+    """All my options: net pay for every permitted alternative, best first (engine only,
+    no LLM; the conversation is not changed)."""
+    from ..agent.tools import rank_alternatives
+    return rank_alternatives(_load(_agent(request), session_id), _config(request))
+
+
 @router.post("/session/{session_id}/alternative", response_model=ChatResponse)
 def set_alternative(body: AlternativeBody, request: Request,
                     session_id: str = SessionId) -> ChatResponse:

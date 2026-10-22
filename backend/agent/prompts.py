@@ -27,6 +27,12 @@ SYSTEM_PROMPT = """\
 "עובדות המדיניות" למטה בלבד, ורק אז הצע לחשב במספרים ובקש את מה שחסר.
 - מספר ילדים - שאל רק אם הוא רלוונטי (מסלול ברוכת ילדים).
 
+שאלה שאין לך עליה מידע:
+- המקורות שלך הם רק "עובדות המדיניות" למטה ותוצאות הכלים. שאלה שאינה מכוסה בהם (מחירי \
+ליסינג, מדרגות מס של שנה אחרת, רכב שאינו בקטלוג, חוקים ותקנות כלליים) - אמור במפורש שאין \
+לך את המידע הזה במערכת. אל תוסיף עובדות מהידע הכללי שלך, גם לא כהשערה ("טרם פורסם", \
+"בדרך כלל"). אם רלוונטי, הצע להעביר את השאלה לנציג/ת שכר או לחשב את מה שכן אפשר.
+
 בדיקת זכאות מוקדמת (Fail-fast):
 - כבר בהודעה הראשונה שבה ידועים העיסוק/הקבוצה והבקשה (רכב מסוים או ויתור) - שמור אותם \
 מיד ב-`update_profile`, עוד לפני נתוני השכר.
@@ -59,6 +65,10 @@ SYSTEM_PROMPT = """\
 - אם `update_profile` שמר את הרכב (הוא מופיע ב-`updated`) - הזיהוי ודאי; אל תבקש אישור \
 מהעובד, המשך הלאה. בקש הבהרה רק אם הכלי דחה את הרכב.
 - שאלות על אילו רכבים מותרים, מסלול ברוכת ילדים או ויתור - `get_allowed_cars`.
+- שאלות כמו "מה הכי משתלם לי?", "איזה רכב חשמלי הכי כדאי?" או "מה כל האפשרויות שלי?" - \
+`rank_alternatives`. הצג את 3 הראשונות ואת הטובה ביותר מבין החשמליות, עם ההפרש בנטו \
+כפי שהוחזר, וציין שההשתתפות לפי טבלת הרכבים של החברה. אם העובד בוחר אחת - שמור אותה \
+ב-`update_profile` והפעל `calculate_comparison`.
 - כשאין נתונים חסרים ויש חלופה מבוקשת - הפעל `calculate_comparison` מיד, בלי לבקש אישור. \
 כל מספר כספי שאתה מציג (נטו, מס, שווי שימוש, הפרש) חייב להגיע מתוצאת כלי, כפי שהוא, \
 בשקלים שלמים.
@@ -78,10 +88,12 @@ def rules_brief(config: AppConfig) -> str:
     """Company policy in plain Hebrew, generated from rules.json + the catalogue."""
     r = config.rules
     groups = ", ".join(f"{g}: {_ils(r.budget(g))}" for g in r.group_order)
-    ft = r.family_track
+    ft, nm = r.family_track, r.net_method
     family_cars = ", ".join(f"{c.model_name} (עלות {_ils(c.company_monthly_cost)})"
                             for c in config.family_track_cars())
-    electric = ", ".join(sorted({c.model_name for c in config.cars if c.drive == ELECTRIC_DRIVE}))
+    # with each car's group, so the model never lists a car above the employee's group
+    electric = ", ".join(sorted(f"{c.model_name} (קבוצה {c.group})"
+                                for c in config.cars if c.drive == ELECTRIC_DRIVE))
     method = ("מגולם: המעסיק משלם את המס, העובד מקבל בדיוק את הסכום נטו"
               if r.electric.method == "gross_up" else "כתוספת ברוטו")
     waiver_amounts = sorted({o.waiver_maintenance for o in config.occupations if o.waiver_allowed})
@@ -91,7 +103,8 @@ def rules_brief(config: AppConfig) -> str:
         f"נמוכה ממנה. תקציב שלא נוצל אינו משולם כשכר.",
         f"- רכב חשמלי: החזר חשמל של {_ils(r.electric.net_bonus)} לחודש, {method}. "
         f"בנוסף, שווי השימוש (הסכום שמתווסף להכנסה החייבת) של רכב חשמלי בקטלוג נמוך בדרך "
-        f"כלל מרכב בנזין דומה. רכבים חשמליים בקטלוג: {electric}.",
+        f"כלל מרכב בנזין דומה. רכבים חשמליים בקטלוג: {electric}. לפני שמציעים רכבים "
+        f"לעובד מסננים לפי הקבוצה שלו, או מפעילים get_allowed_cars.",
         f"- מסלול ברוכת ילדים: להורים ל-{ft.min_children} ילדים ומעלה עד גיל {ft.child_max_age}. "
         f"רכבים: {family_cars}. על הפער מעל תקציב הקבוצה - העובד משלם "
         f"{ft.gap_split_employee:.0%} (ניכוי מהנטו) והמעסיק את השאר.",
@@ -101,6 +114,9 @@ def rules_brief(config: AppConfig) -> str:
         f"{'פנסיונית' if r.waiver.maintenance_is_pensionable else 'לא פנסיונית'}.",
         "- שווי השימוש נלקח מהמאגר הרשמי של רשות המסים ומתווסף להכנסה החייבת במס ובביטוח "
         "לאומי; דמי ההשתתפות ברכב יורדים מהנטו.",
+        f"- שיטת החישוב: נטו חודשי (לא מצטבר) לפי לוחות המס של {nm.tax_year} כפי שהוגדרו "
+        f"בקובץ הכללים, {_ils(nm.credit_point_value)} לנקודת זיכוי. זהו נטו משוער להשוואה "
+        "בין חלופות, לא תלוש רשמי. שווי שימוש קיים רק לרכבים שבקטלוג החברה.",
     ]
     return "\n".join(lines)
 

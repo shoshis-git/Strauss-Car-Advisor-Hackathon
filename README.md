@@ -13,6 +13,8 @@
 
 ## ארכיטקטורה
 
+הסבר מפורט, כולל תרשימים ומנגנוני ההגנה מפני המצאות: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```
  Frontend (React + Vite)  ──HTTP──►  Backend (FastAPI)
    מסך עובד / מסך נציג                │
@@ -124,6 +126,7 @@ cd frontend && npm test           # frontend: Vitest + Testing Library
 | GET | `/api/session/{id}` | מצב שיחה |
 | POST | `/api/demo/{E-001}` | טעינת עובד לדוגמה |
 | GET / POST | `/api/session/{id}/options`, `/alternative` | בחירת חלופה |
+| GET | `/api/session/{id}/ranking` | כל האפשרויות: הנטו לכל חלופה מותרת, מדורג מהמשתלם ביותר |
 | POST | `/api/payslip/extract`, `/api/payslip/apply` | העלאת תלוש ואישור הערכים |
 | GET | `/api/rep/tickets` | פניות שממתינות לנציג (דורש `X-Rep-Token`) |
 | POST | `/api/rep/tickets/{id}/answer` | תשובת נציג; השיחה ממשיכה (דורש `X-Rep-Token`) |

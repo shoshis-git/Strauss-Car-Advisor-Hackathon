@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type DemoEmployee, type Options } from "../api";
+import { api, type DemoEmployee, type Options, type Ranking } from "../api";
 import { useEmployeeSession } from "../useEmployeeSession";
 import { ChatPanel } from "./ChatPanel";
 import { ComparisonDashboard } from "./ComparisonDashboard";
@@ -28,6 +28,27 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
       cancelled = true;
     };
   }, [s.sessionId, group, children, occupation]);
+
+  // All my options: recomputed whenever the inputs it depends on change (pay data,
+  // today's situation, and the selected alternative - to mark it in the list).
+  const [ranking, setRanking] = useState<Ranking | null>(null);
+  const rankingKey = s.state
+    ? JSON.stringify([s.state.profile, s.state.current, s.state.target.target_action, s.state.target.target_car_code])
+    : null;
+  useEffect(() => {
+    if (!s.sessionId || !rankingKey) {
+      setRanking(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .ranking(s.sessionId)
+      .then((r) => !cancelled && setRanking(r))
+      .catch(() => !cancelled && setRanking(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [s.sessionId, rankingKey]);
 
   const name = s.state?.display_name ?? null;
   const subtitle = [occupation, group ? `קבוצה ${group}` : null].filter(Boolean).join(" · ");
@@ -82,7 +103,13 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
         />
       </div>
       <div className="min-w-0">
-        <ComparisonDashboard state={s.state} options={options} busy={s.busy} onSwitch={s.setAlternative} />
+        <ComparisonDashboard
+          state={s.state}
+          options={options}
+          ranking={ranking}
+          busy={s.busy}
+          onSwitch={s.setAlternative}
+        />
       </div>
     </div>
   );
