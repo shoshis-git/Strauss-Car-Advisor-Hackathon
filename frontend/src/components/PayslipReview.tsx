@@ -20,6 +20,9 @@ const UNIT: Partial<Record<PayslipFieldName, string>> = {
 
 const shortLabel = (label: string) => label.split(" (")[0];
 
+/** read from the payslip as text, shown as-is (not editable numbers) */
+const TEXT_FIELDS = new Set<PayslipFieldName>(["occupation", "eligibility_group"]);
+
 interface Row {
   include: boolean;
   text: string;
@@ -98,8 +101,8 @@ function ReviewValues({ extraction, busy, onConfirm, onCancel }: Props) {
   for (const f of extraction.fields) {
     const row = rows[f.field];
     if (!row.include) continue;
-    if (f.field === "occupation") {
-      values.occupation = row.text;
+    if (TEXT_FIELDS.has(f.field)) {
+      values[f.field] = row.text;
       continue;
     }
     const n = Number(row.text.replace(/,/g, ""));
@@ -160,7 +163,7 @@ function ReviewValues({ extraction, busy, onConfirm, onCancel }: Props) {
                 key={f.field}
                 className={`rounded-2xl p-3 ring-1 transition ${
                   row.include ? "bg-mint-50 ring-mint-200" : "bg-ink-50 opacity-70 ring-ink-100"
-                } ${f.field === "occupation" ? "sm:col-span-2" : ""}`}
+                } ${TEXT_FIELDS.has(f.field) ? "sm:col-span-2" : ""}`}
               >
                 <label className="flex items-center gap-2 text-xs font-medium text-ink-600">
                   <input
@@ -173,7 +176,7 @@ function ReviewValues({ extraction, busy, onConfirm, onCancel }: Props) {
                   <span>{label}</span>
                 </label>
                 <div className="mt-1.5">
-                  {f.field === "occupation" ? (
+                  {TEXT_FIELDS.has(f.field) ? (
                     <span className="font-semibold text-ink-900">{row.text}</span>
                   ) : (
                     <span className="flex items-center gap-1">

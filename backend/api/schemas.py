@@ -139,6 +139,8 @@ class PayslipExtractResponse(BaseModel):
 class PayslipValues(BaseModel):
     model_config = ConfigDict(extra="forbid")
     occupation: Optional[str] = Field(None, min_length=1, max_length=100)
+    # only when the payslip shows a group but no occupation (the occupation decides otherwise)
+    eligibility_group: Optional[str] = Field(None, pattern=r"^[אבגד]$")
     base_salary: Optional[float] = Field(None, gt=0, le=1_000_000)
     commissions_bonuses: Optional[float] = Field(None, ge=0, le=1_000_000)
     pension_pct: Optional[float] = Field(None, ge=0, le=100)

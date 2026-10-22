@@ -325,23 +325,105 @@ _SOURCE = {"base_salary": "base_salary", "pension_pct": "pension_pct",
            "current_participation": "car_participation"}
 
 
+# gendered forms ('מנהל/ת', 'אנליסט/ית') and labels are not part of what identifies a job;
+# comparing word sets also survives the RTL repair, which turns 'מנהל/ת פיתוח' into
+# 'ת פיתוח/מנהל' (the slash keeps the visual order)
+_OCC_IGNORED_WORDS = {"ת", "ית", "ה", "תפקיד", "התפקיד", "עיסוק", "העיסוק"}
+
+
+def _occ_words(s: str) -> frozenset[str]:
+    return frozenset(w for w in re.sub(r"[/\\()|·,.:;\-–—״\"]", " ", s).split()
+                     if w not in _OCC_IGNORED_WORDS)
+
+
+def occupation_by_words(config: AppConfig, s: str) -> Optional[str]:
+    """The occupation whose words are exactly the words of `s` (any gender form / order).
+    Only an exact, unambiguous match - a line that merely mentions a job does not count."""
+    from .tools import occupation_variants
+
+    words = _occ_words(s)
+    if not words:
+        return None
+    hits = {o.name for o in config.occupations for v in occupation_variants(o.name)
+            if _occ_words(v) == words}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def value_after_label(text: str, label: str, value: str) -> Optional[tuple[str, str]]:
+    """Payslip layouts often print a label on one line and its value on the next
+    ('נקודות זיכוי' / '2.75'). Returns (value, 'label value') - only when the label line
+    holds nothing but the label and the next line nothing but a value of that shape."""
+    lines = [ln.strip() for ln in text.splitlines()]
+    for i, ln in enumerate(lines[:-1]):
+        if re.fullmatch(label + r"\s*:?", ln) and re.fullmatch(value, lines[i + 1]):
+            return lines[i + 1], f"{ln} {lines[i + 1]}"
+    return None
+
+
+_CREDIT_LABEL = r"(?:נקודות|נק['׳]?)\s*זיכוי"
+_GROUP_LABEL = r"קבוצת\s*(?:ה)?זכאות(?:\s*(?:ל|ב)?רכב)?"
+
+
 def _verify_occupation(raw_occ: Any, text: str, config: AppConfig,
                        res: PayslipExtraction) -> None:
     from .tools import resolve_occupation
 
     label = FIELD_LABELS["occupation"]
+    norm = lambda s: re.sub(r"\s+", " ", s).strip()  # noqa: E731
+    lines = [ln.strip() for ln in text.splitlines()]
+    line = occ = None
+    if raw_occ and isinstance(raw_occ, str):
+        line = next((ln for ln in lines if norm(raw_occ) in norm(ln)), None)
+        occ = resolve_occupation(config, raw_occ, fuzzy=True) or occupation_by_words(config, raw_occ)
+        if line is not None and occ is not None:
+            res.fields.insert(0, ExtractedField("occupation", label, occ, line))
+            return
+    # the model missed it (or quoted it differently): a payslip line that is exactly an
+    # occupation of the table - also when the RTL repair scrambled its gender slash
+    for ln in lines:
+        found = occupation_by_words(config, ln)
+        if found:
+            res.fields.insert(0, ExtractedField("occupation", label, found, ln))
+            return
     if not raw_occ or not isinstance(raw_occ, str):
         res.not_found.append(label)
-        return
-    norm = lambda s: re.sub(r"\s+", " ", s).strip()  # noqa: E731
-    line = next((ln.strip() for ln in text.splitlines() if norm(raw_occ) in norm(ln)), None)
-    occ = resolve_occupation(config, raw_occ, fuzzy=True)
-    if line is None:
+    elif line is None:
         res.rejected.append(f"{label}: '{raw_occ}' לא נמצא בתלוש")
-    elif occ is None:
-        res.rejected.append(f"{label}: '{raw_occ}' אינו בטבלת העיסוקים - יש לציין עיסוק בצ'אט")
     else:
-        res.fields.insert(0, ExtractedField("occupation", label, occ, line))
+        res.rejected.append(f"{label}: '{raw_occ}' אינו בטבלת העיסוקים - יש לציין עיסוק בצ'אט")
+
+
+def _labelled_fallbacks(text: str, config: AppConfig, res: PayslipExtraction) -> None:
+    """Values printed under their label (next line), when the model did not report them."""
+    have = {f.field for f in res.fields}
+    if "credit_points" not in have:
+        hit = value_after_label(text, _CREDIT_LABEL, r"\d+(?:\.\d+)?")
+        if hit:
+            value = float(hit[0])
+            lo, hi = PAYSLIP_FIELDS["credit_points"]
+            if lo <= value <= hi:
+                res.fields.append(ExtractedField("credit_points", FIELD_LABELS["credit_points"],
+                                                 value, hit[1]))
+                res.not_found = [n for n in res.not_found if n != FIELD_LABELS["credit_points"]]
+
+    # eligibility group: the employee's group comes from the occupation; a group printed on
+    # the payslip is used only when the occupation is not there, and a conflict is reported
+    hit = value_after_label(text, _GROUP_LABEL, r"[אבגד]['׳]?")
+    if hit is None:
+        m = next((re.search(_GROUP_LABEL + r"\s*:?\s*([אבגד])['׳]?(?![א-ת])", ln)
+                  for ln in text.splitlines() if re.search(_GROUP_LABEL, ln)), None)
+        hit = (m.group(1), m.group(0).strip()) if m else None
+    if hit is None:
+        return
+    group = hit[0].rstrip("'׳")
+    occ = next((f.value for f in res.fields if f.field == "occupation"), None)
+    if occ is None:
+        res.fields.append(ExtractedField("eligibility_group",
+                                         FIELD_LABELS["eligibility_group"], group, hit[1]))
+    elif config.occupation(str(occ)).eligibility_group != group:
+        derived = config.occupation(str(occ)).eligibility_group
+        res.rejected.append(f"קבוצת זכאות: בתלוש כתוב {group}, אבל לפי העיסוק '{occ}' הקבוצה "
+                            f"היא {derived} - הקבוצה נקבעת לפי העיסוק")
 
 
 def verify(raw: dict[str, Any], text: str, config: AppConfig) -> PayslipExtraction:
@@ -383,6 +465,7 @@ def verify(raw: dict[str, Any], text: str, config: AppConfig) -> PayslipExtracti
     else:
         res.not_found.append(FIELD_LABELS["commissions_bonuses"])
     _verify_occupation(raw.get("occupation"), text, config, res)
+    _labelled_fallbacks(text, config, res)
     return res
 
 
