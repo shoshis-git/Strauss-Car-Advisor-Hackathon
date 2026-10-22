@@ -17,3 +17,4 @@ TAX_CSV = DATA_DIR / "tax_authority_2026.csv"
 CAR_ALIASES_JSON = DATA_DIR / "car_aliases.json"
 APP_DB = DATA_DIR / "app_data.db"
 UNIFIED_CONFIG_JSON = DATA_DIR / "config.json"
+DEMO_ACCESS_JSON = DATA_DIR / "demo_access.json"  # employee login codes for the demo

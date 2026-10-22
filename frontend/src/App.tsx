@@ -1,6 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, API_BASE, ApiError, getRepKey, type DemoEmployee } from "./api";
+import {
+  api,
+  API_BASE,
+  ApiError,
+  getAuth,
+  getRepKey,
+  LOGOUT_EVENT,
+  setAuth,
+  type Auth,
+  type DemoEmployee,
+} from "./api";
 import { EmployeeScreen } from "./components/EmployeeScreen";
+import { LoginScreen } from "./components/LoginScreen";
 import { RepDashboard } from "./components/RepDashboard";
 
 type Tab = "employee" | "rep";
@@ -31,6 +42,22 @@ export default function App() {
   const [ticketCount, setTicketCount] = useState(0);
   const [repAuthed, setRepAuthed] = useState(() => getRepKey() !== null);
   const onCount = useCallback((n: number) => setTicketCount(n), []);
+  // employee login (token in sessionStorage - survives a refresh of this tab)
+  const [auth, setAuthState] = useState<Auth | null>(getAuth);
+  const login = useCallback((a: Auth) => {
+    setAuth(a);
+    setAuthState(a);
+  }, []);
+  const logout = useCallback(() => {
+    setAuth(null);
+    setAuthState(null);
+  }, []);
+  // the server refused the token (expired / server key changed): back to the login screen
+  useEffect(() => {
+    const onLogout = () => setAuthState(null);
+    window.addEventListener(LOGOUT_EVENT, onLogout);
+    return () => window.removeEventListener(LOGOUT_EVENT, onLogout);
+  }, []);
 
   // A cloud server on a free plan sleeps when idle; the first request can fail or hang
   // while it wakes up (~30-60s). Retry quietly before showing an error.
@@ -167,7 +194,11 @@ export default function App() {
         )}
         {/* both screens stay mounted so switching tabs keeps the conversation */}
         <div hidden={tab !== "employee"}>
-          <EmployeeScreen demoEmployees={demo} />
+          {auth ? (
+            <EmployeeScreen key={auth.session_id} auth={auth} onLogout={logout} />
+          ) : (
+            <LoginScreen demoEmployees={demo} onLogin={login} />
+          )}
         </div>
         <div hidden={tab !== "rep"}>
           {tab === "rep" && <RepDashboard onCountChange={onCount} onAuthChange={setRepAuthed} />}

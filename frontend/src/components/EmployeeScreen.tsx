@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
-import { api, type DemoEmployee, type Options, type Ranking } from "../api";
+import { api, type Auth, type Options, type Ranking } from "../api";
 import { useEmployeeSession } from "../useEmployeeSession";
 import { ChatPanel } from "./ChatPanel";
 import { ComparisonDashboard } from "./ComparisonDashboard";
-import { DemoSelector } from "./DemoSelector";
 import { PayslipReview } from "./PayslipReview";
 
-export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[] }) {
-  const s = useEmployeeSession();
+export function EmployeeScreen({ auth, onLogout }: { auth: Auth; onLogout: () => void }) {
+  const s = useEmployeeSession(auth.session_id);
   const [options, setOptions] = useState<Options | null>(null);
   const group = s.state?.profile.eligibility_group ?? null;
   const children = s.state?.profile.children_count ?? null;
@@ -29,12 +28,19 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
     };
   }, [s.sessionId, group, children, occupation]);
 
-  // All my options: recomputed whenever the inputs it depends on change (pay data,
-  // today's situation, and the selected alternative - to mark it in the list).
+  // All my options: loaded only once there is an answer (a calculated comparison) or the
+  // employee asked for it ("מה הכי משתלם לי?") - the conversation starts from their own
+  // question. Then recomputed whenever its inputs change (pay data, today's situation and
+  // the selected alternative - to mark it in the list).
   const [ranking, setRanking] = useState<Ranking | null>(null);
-  const rankingKey = s.state
-    ? JSON.stringify([s.state.profile, s.state.current, s.state.target.target_action, s.state.target.target_car_code])
-    : null;
+  const [rankingRequested, setRankingRequested] = useState(false);
+  const c = s.state?.last_comparison;
+  const hasComparison = !!c && c.is_eligible && c.net_alt !== null;
+  const rankingWanted = hasComparison || rankingRequested;
+  const rankingKey =
+    s.state && rankingWanted
+      ? JSON.stringify([s.state.profile, s.state.current, s.state.target.target_action, s.state.target.target_car_code])
+      : null;
   useEffect(() => {
     if (!s.sessionId || !rankingKey) {
       setRanking(null);
@@ -73,20 +79,26 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
                     {name ? name.trim().charAt(0) : "?"}
                   </span>
                   <div className="min-w-0">
-                    <div className="truncate font-display text-base font-semibold text-ink-900">{name ?? "שיחה חדשה"}</div>
-                    <div className="truncate text-xs text-ink-500">{subtitle || "ספר/י לי על התפקיד והרכב"}</div>
+                    <div className="truncate font-display text-base font-semibold text-ink-900">
+                      {name ?? (auth.kind === "guest" ? "אורח/ת" : "שיחה חדשה")}
+                    </div>
+                    <div className="truncate text-xs text-ink-500">
+                      {subtitle || "ספר/י לי על התפקיד והרכב"}
+                      {auth.kind === "employee" && (
+                        <span className="ms-1.5 inline-flex items-center gap-1 text-mint-700">· ✓ מחובר/ת</span>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={s.reset}
+                  onClick={onLogout}
                   disabled={s.busy}
                   className="shrink-0 rounded-full bg-white px-4 py-1.5 text-xs font-semibold text-ink-700 ring-1 ring-ink-100 transition hover:bg-lilac-50 hover:ring-lilac-200 disabled:opacity-50"
                 >
-                  שיחה חדשה
+                  יציאה
                 </button>
               </div>
-              <DemoSelector employees={demoEmployees} activeName={name} busy={s.busy} onLoad={s.loadDemo} />
             </div>
           }
           review={
@@ -107,6 +119,8 @@ export function EmployeeScreen({ demoEmployees }: { demoEmployees: DemoEmployee[
           state={s.state}
           options={options}
           ranking={ranking}
+          rankingWanted={rankingWanted}
+          onRequestRanking={() => setRankingRequested(true)}
           busy={s.busy}
           onSwitch={s.setAlternative}
         />

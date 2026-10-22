@@ -32,6 +32,14 @@ afterEach(cleanup);
 
 const T = { timeout: 15000 };
 
+/** The login screen is the gate: continue as a guest and wait for the chat box. */
+async function loginAsGuest(): Promise<HTMLElement> {
+  fireEvent.click(await screen.findByRole("button", { name: "המשך כאורח" }, T));
+  const box = await screen.findByLabelText("הודעה ליועץ", {}, T);
+  await screen.findByText(/אני יועץ הרכב/, {}, T); // the guest greeting
+  return box;
+}
+
 describe.skipIf(!health)("App ↔ backend", () => {
   it("the rep tickets are closed without the rep key", async () => {
     expect((await fetch(`${API_BASE}/api/rep/tickets`)).status).toBe(401);
@@ -50,22 +58,83 @@ describe.skipIf(!health)("App ↔ backend", () => {
     expect(r.headers.get("access-control-allow-origin")).toBe("http://localhost:5173");
   });
 
-  it("loading demo E-001 shows the reference numbers and the detailed table", async () => {
+  it("the conversation routes refuse requests without a login token", async () => {
+    const r = await fetch(`${API_BASE}/api/session/${"0".repeat(32)}`);
+    expect(r.status).toBe(401);
+  });
+
+  it("a wrong code is refused on the login screen", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /נועה לוי/ }, T));
+    fireEvent.change(await screen.findByLabelText("מספר עובד", {}, T), { target: { value: "1" } });
+    fireEvent.change(screen.getByLabelText("קוד"), { target: { value: "0000" } });
+    fireEvent.click(screen.getByRole("button", { name: "כניסה עם מספר עובד" }));
+    expect((await screen.findByRole("alert", {}, T)).textContent).toContain("מספר עובד או קוד שגויים");
+    expect((screen.getByLabelText("מספר עובד") as HTMLInputElement).value).toBe("E-001");
+    expect(screen.queryByLabelText("הודעה ליועץ")).toBeNull(); // still on the login screen
+  });
+
+  it("demo login E-001 preloads the record; all my options appear only after an answer", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    // personal greeting from the preloaded record
+    await screen.findByText(/שלום נועה!/, {}, T);
+    expect(sessionStorage.getItem("car-advisor.auth")).toContain("token");
+    // before any answer: only the invitation, not the ranked list
+    await screen.findByTestId("all-options-request", {}, T);
+    expect(screen.queryByTestId("all-options")).toBeNull();
+
+    // no LLM involved: the invitation opens the ranking; pick the Atto 3 from it
+    // (it is #7 for her - cheaper permitted cars and the waiver leave her more)
+    fireEvent.click(screen.getByTestId("all-options-request"));
+    fireEvent.click(await screen.findByRole("button", { name: /הצג את כל/ }, T));
+    const atto = await screen.findByRole("button", { name: /^ATTO 3:/ }, T);
+    expect(atto.getAttribute("aria-label")).toContain("+661 ₪");
+    fireEvent.click(atto);
     const diff = await screen.findByTestId("net-diff", {}, T);
-    expect(diff.textContent).toContain("+661 ₪");
+    await waitFor(() => expect(diff.textContent).toContain("+661 ₪"), T);
     expect(screen.getAllByText("11,032 ₪").length).toBeGreaterThan(0);
     expect(screen.getAllByText("11,693 ₪").length).toBeGreaterThan(0);
     expect(screen.getByText("החזר חשמל (ברוטו, מגולם)")).toBeTruthy();
     expect(screen.getByText("440 ₪")).toBeTruthy();
-    // the original question is in the chat in the same render as the numbers
-    expect(screen.getByText(/אם אעבור מהקורולה קרוס/)).toBeTruthy();
+    // after the answer the heading compares with the checked option
+    await screen.findByText("יש 6 אפשרויות שמשאירות לך יותר נטו", {}, T);
+  });
+
+  it.skipIf(!deterministic)(
+    "after asking in the chat, the ranked options appear by themselves",
+    async () => {
+      render(<App />);
+      fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+      const box = await screen.findByLabelText("הודעה ליועץ", {}, T);
+      await screen.findByText(/שלום נועה!/, {}, T);
+      fireEvent.change(box, { target: { value: "אני רוצה לעבור לאטו 3" } });
+      fireEvent.click(screen.getByRole("button", { name: "שליחה" }));
+      await waitFor(() => expect(screen.getByTestId("net-diff").textContent).toContain("+661 ₪"), T);
+      // no click needed: the answer brings the ranking
+      await screen.findByTestId("all-options", {}, T);
+      expect(screen.queryByTestId("all-options-request")).toBeNull();
+    },
+    30000,
+  );
+
+  it("the login survives a refresh, and logout returns to the login screen", async () => {
+    const first = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    await screen.findByText(/שלום נועה!/, {}, T);
+    first.unmount(); // "refresh": a new App reads the token from sessionStorage
+    render(<App />);
+    await screen.findByText(/שלום נועה!/, {}, T);
+    fireEvent.click(screen.getByRole("button", { name: "יציאה" }));
+    await screen.findByRole("button", { name: "כניסה עם מספר עובד" }, T);
+    expect(sessionStorage.getItem("car-advisor.auth")).toBeNull();
   });
 
   it("quick switch recalculates for another allowed car", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /נועה לוי/ }, T));
+    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    fireEvent.click(await screen.findByTestId("all-options-request", {}, T));
+    fireEvent.click(await screen.findByRole("button", { name: /הצג את כל/ }, T));
+    fireEvent.click(await screen.findByRole("button", { name: /^ATTO 3:/ }, T));
     await screen.findByTestId("net-diff", {}, T);
     const select = (await screen.findByLabelText(
       "בחירת חלופה מתוך הרכבים המותרים", {}, T)) as HTMLSelectElement;
@@ -80,7 +149,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
     "fail-fast: a developer asking for a Tesla is told immediately, and picks an alternative",
     async () => {
       render(<App />);
-      const box = await screen.findByLabelText("הודעה ליועץ");
+      const box = await loginAsGuest();
       fireEvent.change(box, { target: { value: "אני מפתח תוכנה ורוצה לקחת טסלה מודל 3" } });
       fireEvent.click(screen.getByRole("button", { name: "שליחה" }));
       const blocked = await screen.findByTestId("blocked", {}, T);
@@ -102,6 +171,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
     async () => {
       const pdf = await (await fetch(e004Pdf)).arrayBuffer();
       render(<App />);
+      await loginAsGuest();
       const input = (await screen.findByLabelText("קובץ תלוש שכר", {}, T)) as HTMLInputElement;
       const file = new File([pdf], "payslip.pdf", { type: "application/pdf" });
       Object.defineProperty(input, "files", { value: [file] });
@@ -130,7 +200,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
     "chat → freeze → rep answers on the rep screen → employee sees the new result",
     async () => {
       render(<App />);
-      const box = await screen.findByLabelText("הודעה ליועץ");
+      const box = await loginAsGuest();
       const send = async (text: string) => {
         fireEvent.change(box, { target: { value: text } });
         fireEvent.click(screen.getByRole("button", { name: "שליחה" }));

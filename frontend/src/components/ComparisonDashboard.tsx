@@ -9,6 +9,9 @@ interface Props {
   onSwitch: (choice: { car_id: string } | { waiver: true }) => void;
   /** all my options (every permitted alternative, ranked) - optional */
   ranking?: Ranking | null;
+  /** the ranking is shown (after a calculated answer, or once asked for) */
+  rankingWanted?: boolean;
+  onRequestRanking?: () => void;
 }
 
 const TREND_TEXT: Record<Trend, string> = {
@@ -507,6 +510,9 @@ export function ComparisonDashboard(props: Props) {
 
       <AllOptions
         ranking={props.ranking ?? null}
+        wanted={!!props.rankingWanted}
+        onRequest={props.onRequestRanking}
+        currentDiff={c && c.is_eligible ? c.net_diff : null}
         busy={props.busy}
         locked={state.waiting_for_rep}
         onSwitch={props.onSwitch}

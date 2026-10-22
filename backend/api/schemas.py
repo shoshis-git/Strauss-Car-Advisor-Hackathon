@@ -46,19 +46,47 @@ class MessageView(BaseModel):
     created_at: str
 
 
+# --- login ------------------------------------------------------------------- #
+class LoginRequest(BaseModel):
+    """Employee: emp_id + code. Guest: guest=true (an empty conversation)."""
+    model_config = ConfigDict(extra="forbid")
+    emp_id: Optional[str] = Field(None, pattern=r"^E-\d{3}$", examples=["E-001"])
+    code: Optional[str] = Field(None, min_length=1, max_length=64)
+    guest: bool = False
+
+    @model_validator(mode="after")
+    def _employee_or_guest(self) -> "LoginRequest":
+        if self.guest == bool(self.emp_id or self.code):
+            raise ValueError("send either emp_id + code, or guest=true")
+        if not self.guest and not (self.emp_id and self.code):
+            raise ValueError("emp_id and code are both required")
+        return self
+
+
+class LoginResponse(BaseModel):
+    token: str = Field(description="לשלוח בכל בקשה: Authorization: Bearer <token>")
+    token_type: Literal["bearer"] = "bearer"
+    expires_at: int
+    session_id: str
+    kind: Literal["employee", "guest"]
+    employee_name: Optional[str] = None
+    bot_message: str
+    state: "StateView"
+
+
 # --- employee ---------------------------------------------------------------- #
 class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(
         None, pattern=SESSION_ID_PATTERN,
-        description="אופציונלי. בהודעה הראשונה לא שולחים - השרת פותח שיחה ומחזיר session_id; "
-                    "בהודעות הבאות שולחים את המזהה שהתקבל.")
+        description="אופציונלי - השיחה נקבעת לפי הטוקן. אם נשלח, חייב להיות זהה לשיחה "
+                    "שבטוקן.")
     message: str = Field(..., min_length=1, max_length=4000)
 
 
 CHAT_EXAMPLES = {
-    "first": {"summary": "הודעה ראשונה (בלי session_id)",
+    "first": {"summary": "הודעה (השיחה נקבעת לפי הטוקן)",
               "value": {"message": "אני מנהל אזור מכירות, שכר בסיס 16,000"}},
-    "next": {"summary": "הודעה בשיחה קיימת",
+    "next": {"summary": "הודעה עם מזהה שיחה מפורש",
              "value": {"session_id": "0123456789abcdef0123456789abcdef",
                        "message": "פנסיה 6%, השתלמות 2.5%"}},
 }
@@ -119,7 +147,7 @@ class PayslipValues(BaseModel):
 class PayslipApplyRequest(BaseModel):
     session_id: Optional[str] = Field(
         None, pattern=SESSION_ID_PATTERN,
-        description="אופציונלי - בלי מזהה נפתחת שיחה חדשה (תלוש לפני הודעה ראשונה)")
+        description="אופציונלי - השיחה נקבעת לפי הטוקן; אם נשלח, חייב להיות זהה לה")
     values: PayslipValues
 
     @model_validator(mode="after")

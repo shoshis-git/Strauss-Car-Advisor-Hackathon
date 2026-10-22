@@ -159,13 +159,17 @@ class TaxAuthorityDB:
             build_database(csv_path, db_path)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # one connection shared by the server's worker threads: queries must not
+        # interleave on it (concurrent requests otherwise got empty results -> 500)
+        self._query_lock = threading.Lock()
         if drive_names is None:
             from .config_loader import load_rules
             drive_names = load_rules().value_of_use.drive_names
         self._drive_names = dict(drive_names)
 
     def count(self) -> int:
-        return self._conn.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
+        with self._query_lock:
+            return self._conn.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
 
     def get_value_of_use(
         self,
@@ -176,12 +180,13 @@ class TaxAuthorityDB:
         vehicle_type_code: int = 1,
     ) -> Optional[VehicleValueRecord]:
         """Lookup by the full official key. Returns None when no record exists."""
-        rows = self._conn.execute(
-            f"SELECT * FROM {TABLE} WHERE tax_year=? AND registration_year=? "
-            "AND vehicle_type_code=? AND manufacturer_code=? AND model_code=?",
-            (int(tax_year), int(registration_year), int(vehicle_type_code),
-             int(manufacturer_code), int(model_code)),
-        ).fetchall()
+        with self._query_lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM {TABLE} WHERE tax_year=? AND registration_year=? "
+                "AND vehicle_type_code=? AND manufacturer_code=? AND model_code=?",
+                (int(tax_year), int(registration_year), int(vehicle_type_code),
+                 int(manufacturer_code), int(model_code)),
+            ).fetchall()
         if not rows:
             return None
         if len(rows) > 1:

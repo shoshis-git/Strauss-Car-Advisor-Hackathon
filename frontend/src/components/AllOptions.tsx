@@ -4,6 +4,11 @@ import { ils, signedIls, trend } from "../format";
 
 interface Props {
   ranking: Ranking | null;
+  /** shown after a calculated answer, or once the employee asked for it */
+  wanted: boolean;
+  onRequest?: () => void;
+  /** net difference of the alternative shown above (null = no calculated answer yet) */
+  currentDiff: number | null;
   busy: boolean;
   locked: boolean;
   onSwitch: (choice: { car_id: string } | { waiver: true }) => void;
@@ -85,16 +90,45 @@ function OptionRow({ o, max, disabled, onPick }: { o: RankedOption; max: number;
 }
 
 /** Every permitted alternative, ranked by the monthly net change (all numbers from the engine). */
-export function AllOptions({ ranking, busy, locked, onSwitch }: Props) {
+export function AllOptions({ ranking, wanted, onRequest, currentDiff, busy, locked, onSwitch }: Props) {
   const [expanded, setExpanded] = useState(false);
-  if (!ranking) return null;
+
+  // before the first answer: only an invitation - the conversation starts from the
+  // employee's own question
+  if (!wanted) {
+    if (!onRequest) return null;
+    return (
+      <button
+        type="button"
+        onClick={onRequest}
+        disabled={busy}
+        className="flex w-full items-center justify-between gap-3 rounded-[1.75rem] border-2 border-dashed border-mint-200 bg-white/60 px-5 py-4 text-start transition hover:bg-mint-50 disabled:opacity-50"
+        data-testid="all-options-request"
+      >
+        <span>
+          <span className="block font-display text-base font-semibold text-ink-900">מה הכי משתלם לי?</span>
+          <span className="mt-0.5 block text-xs text-ink-500">
+            דירוג של כל הרכבים המותרים לך והוויתור, לפי השינוי בנטו החודשי
+          </span>
+        </span>
+        <span className="chip shrink-0 bg-mint-100 text-mint-700">הצג</span>
+      </button>
+    );
+  }
+
+  if (!ranking) {
+    return (
+      <div className="rounded-[1.75rem] bg-white/50 p-5 text-sm text-ink-500" role="status">
+        מחשב את כל האפשרויות שלך…
+      </div>
+    );
+  }
 
   if (!ranking.ok) {
-    if (!ranking.missing_labels?.length) return null;
     return (
       <div className="rounded-[1.75rem] border-2 border-dashed border-mint-200 bg-white/50 p-5 text-sm text-ink-600" data-testid="all-options-pending">
-        <span className="font-display font-semibold text-ink-900">כל האפשרויות שלך</span> - דירוג של כל הרכבים
-        המותרים והוויתור לפי הנטו יופיע כשיהיו: {ranking.missing_labels.join(" · ")}
+        <span className="font-display font-semibold text-ink-900">כל האפשרויות שלך</span> - הדירוג יופיע כשיהיו:{" "}
+        {ranking.missing_labels?.join(" · ") || "כל הנתונים"}
       </div>
     );
   }
@@ -106,6 +140,14 @@ export function AllOptions({ ranking, busy, locked, onSwitch }: Props) {
   const best = ranking.best;
   const bestElectric = ranking.best_electric;
   const pick = (o: RankedOption) => onSwitch(o.kind === "waiver" ? { waiver: true } : { car_id: o.car_id! });
+  // after an answer: compare against the alternative that was just checked
+  const better = currentDiff === null ? 0 : options.filter((o) => o.net_diff > currentDiff).length;
+  const title =
+    currentDiff === null
+      ? "כל האפשרויות שלך"
+      : better > 0
+        ? `יש ${better} ${better === 1 ? "אפשרות שמשאירה" : "אפשרויות שמשאירות"} לך יותר נטו`
+        : "בדקת את האפשרות המשתלמת ביותר עבורך";
 
   return (
     <section
@@ -115,7 +157,7 @@ export function AllOptions({ ranking, busy, locked, onSwitch }: Props) {
     >
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div>
-          <h3 className="font-display text-xl font-semibold text-ink-900">כל האפשרויות שלך</h3>
+          <h3 className="font-display text-xl font-semibold text-ink-900">{title}</h3>
           <p className="mt-0.5 text-xs text-ink-500">
             נטו היום <span className="num font-semibold text-ink-700">{ils(ranking.net_today)}</span> ({ranking.current_label}) ·{" "}
             <span className="num">{ranking.count}</span> חלופות מותרות, מדורגות לפי השינוי בנטו החודשי
