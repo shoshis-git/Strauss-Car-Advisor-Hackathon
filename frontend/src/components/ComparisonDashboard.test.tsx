@@ -52,7 +52,7 @@ describe("ComparisonDashboard", () => {
     expect(screen.getAllByText("11,693 ₪")).toHaveLength(2);
     const diff = screen.getByTestId("net-diff");
     expect(diff.textContent).toContain("+661 ₪");
-    expect(diff.className).toContain("emerald");
+    expect(diff.className).toContain("mint"); // positive = pastel green
     expect(screen.getByText(E001.explanation)).toBeTruthy();
   });
 
@@ -61,7 +61,7 @@ describe("ComparisonDashboard", () => {
     render(<ComparisonDashboard state={stateWith(worse)} options={OPTIONS} busy={false} onSwitch={() => {}} />);
     const diff = screen.getByTestId("net-diff");
     expect(diff.textContent).toContain("-1,032 ₪");
-    expect(diff.className).toContain("red");
+    expect(diff.className).toContain("blush"); // negative = pastel pink-red
   });
 
   it("builds the line-by-line table incl. electric refund and taxes", () => {
