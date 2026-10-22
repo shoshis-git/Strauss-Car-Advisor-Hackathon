@@ -8,7 +8,9 @@ from typing import Any, Callable, Optional
 
 from ..data_loader.config_loader import AppConfig, Car, Employee
 from ..engine.comparator import compare, display_round
-from ..engine.eligibility import AlternativeRequest, check_eligibility, tax_value_of_use
+from ..engine.calculator import calculate_scenario
+from ..engine.eligibility import (AlternativeRequest, check_eligibility, current_scenario,
+                                  tax_value_of_use)
 from .state import FIELD_LABELS, ConversationState, compute_missing, is_blocked
 
 WAIVER = "waiver"
@@ -555,13 +557,31 @@ def start_new_case(state: ConversationState, config: AppConfig) -> dict:
             "missing_labels": [FIELD_LABELS[f] for f in state.missing_info]}
 
 
+def today_preview(state: ConversationState, config: AppConfig) -> Optional[dict[str, Any]]:
+    """Today's side only (engine), when the pay data and today's situation are known -
+    shown while the alternative waits for a missing value. None if it cannot be computed."""
+    if ranking_missing(state):
+        return None
+    emp = build_employee(state, config)
+    today = calculate_scenario(emp, current_scenario(config, emp), config.rules)
+    tgt = state.target
+    alt_label = ("ויתור על הרכב" if tgt.target_action == WAIVER
+                 else config.car(tgt.target_car_code).model_name if tgt.target_car_code else None)
+    return {"today": _side_breakdown(today, config), "alternative_label": alt_label}
+
+
 def ask_representative(state: ConversationState, config: AppConfig,
                        question: str, field: Optional[str] = None) -> dict:
-    """Freeze the conversation until a representative answers `question`."""
+    """Freeze the conversation until a representative answers `question`. In the meantime
+    the employee sees today's net; a result computed with a value now in question (e.g. the
+    catalogue participation the employee said is different for them) is withdrawn."""
     state.waiting_for_rep = True
     state.rep_question = question
     state.rep_field = field
-    return {"ok": True, "status": "waiting_for_rep", "question": question, "field": field}
+    state.last_comparison = None
+    state.today_preview = today_preview(state, config)
+    return {"ok": True, "status": "waiting_for_rep", "question": question, "field": field,
+            "net_today": state.today_preview["today"]["net"] if state.today_preview else None}
 
 
 # --------------------------------------------------------------------------- #

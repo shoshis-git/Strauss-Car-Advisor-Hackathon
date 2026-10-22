@@ -505,6 +505,12 @@ def test_rep_flow_freeze_ticket_answer(client):
     frozen = chat(client, s, SPECIAL_PARTICIPATION)
     assert frozen["frozen"] and frozen["state"]["waiting_for_rep"]
     assert frozen["comparison"] is None
+    # in the meantime: today's net (engine), the alternative follows the answer
+    ref = CONFIG.reference_calculation("E-004")
+    preview = frozen["state"]["today_preview"]
+    assert preview["today"]["net"] == ref.net_current and preview["alternative_label"] == "EV3"
+    assert frozen["state"]["last_comparison"] is None
+    assert "בינתיים, הנטו שלך היום" in frozen["bot_message"] and "10,693" in frozen["bot_message"]
 
     ts = tickets(client)
     assert len(ts) == 1
@@ -516,16 +522,16 @@ def test_rep_flow_freeze_ticket_answer(client):
     assert t["last_employee_message"] == SPECIAL_PARTICIPATION
 
     still = chat(client, s, "יש תשובה?")  # employee writes while frozen
-    assert still["frozen"]
+    assert still["frozen"] and "10,693" in still["bot_message"]
 
     ans = rep_answer(client, s.sid, answer_text="ההשתתפות שאושרה היא 350 ₪")
     assert ans.status_code == 200, ans.text
     a = ans.json()
-    ref = CONFIG.reference_calculation("E-004")
     assert a["ok"] and not a["waiting_for_rep"] and "state" not in a  # no full state to the rep
     assert a["employee_name"] is None  # guest, not an identified employee
     st = session(client, s)["state"]
     assert st["target"]["target_participation"] == 350
+    assert st["today_preview"] is None  # the full comparison replaced it
     assert a["comparison"]["net_today"] == ref.net_current
     assert a["comparison"]["net_alt"] == ref.net_alternative - 50  # 350 instead of 300
     assert "11,850" in a["bot_message"]
@@ -533,6 +539,24 @@ def test_rep_flow_freeze_ticket_answer(client):
 
     roles = [m["role"] for m in session(client, s)["messages"]]
     assert "representative" in roles
+
+
+def test_agreed_otherwise_withdraws_the_catalogue_result_until_the_rep_answers(client):
+    s = login(client, "E-001")
+    first = chat(client, s, "אני רוצה לעבור לאטו 3")
+    assert first["comparison"]["alternative_participation_source"] == "company_catalogue_default"
+    assert "לפי קטלוג הרכבים של החברה: 300 ₪" in first["bot_message"]
+
+    frozen = chat(client, s, "אצלי סוכם אחרת ואני לא יודעת כמה")
+    st = frozen["state"]
+    assert frozen["frozen"] and st["missing_info"] == ["target_participation"]
+    # the +661 computed with the catalogue amount is not shown as a result any more
+    assert st["last_comparison"] is None and st["today_preview"]["today"]["net"] == 11032
+
+    a = rep_answer(client, s.sid, answer_text="השתתפות 350 ₪, בתוקף מ-1/1").json()
+    assert a["comparison"]["net_alt"] == 11693 - 50
+    assert a["comparison"]["alternative_participation_source"] == "approved_by_representative"
+    assert "כפי שאישר/ה הנציג/ה" in a["bot_message"]
 
 
 def test_rep_answer_with_explicit_participation_field(client):

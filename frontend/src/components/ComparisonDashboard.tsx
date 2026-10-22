@@ -473,6 +473,46 @@ function Blocked({ state, busy, onSwitch }: Props & { state: StateView }) {
   );
 }
 
+/** "In the meantime, here is today": today's net from the engine; the alternative waits for
+ *  the representative's answer and appears by itself when it arrives. */
+function WaitingForRep({ state }: { state: StateView }) {
+  const p = state.today_preview;
+  const alt = p?.alternative_label ?? "החלופה";
+  return (
+    <div
+      className="grid grid-cols-1 gap-5 rounded-[2rem] bg-linear-to-br from-butter-50 via-white to-lilac-50 p-6 ring-1 ring-white md:grid-cols-2"
+      data-testid="waiting-for-rep"
+    >
+      <div className="min-w-0">
+        <span className="chip bg-white/80 font-semibold text-ink-700">היום · {p?.today.label ?? "המצב הנוכחי"}</span>
+        <p className="mt-4 font-display text-base text-ink-600">הנטו שלך היום</p>
+        {p ? (
+          <div className="num mt-1 font-display text-5xl font-semibold leading-none tracking-tight text-ink-900" data-testid="net-today">
+            {ils(p.today.net)}
+          </div>
+        ) : (
+          <p className="mt-1 text-sm text-ink-500">יחושב כשיהיו נתוני השכר והרכב הנוכחי.</p>
+        )}
+        {p && (
+          <p className="mt-3 text-xs text-ink-500">
+            מס הכנסה <span className="num">{ils(p.today.income_tax)}</span> · ביטוח לאומי ובריאות{" "}
+            <span className="num">{ils(p.today.btl_health)}</span> · שווי שימוש{" "}
+            <span className="num">{ils(p.today.value_of_use)}</span>
+          </p>
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col justify-center gap-2 rounded-3xl border-2 border-dashed border-butter-200 bg-white/70 p-5">
+        <span className="chip w-fit bg-butter-100 text-butter-700">⏳ ממתין לנציג/ת שכר</span>
+        <p className="font-display text-lg font-semibold text-ink-900">{alt}</p>
+        <p className="text-sm leading-relaxed text-ink-600">
+          חסר נתון שאין לי - שאלתי את הנציג/ה. החלופה תתעדכן כאן לבד כשתגיע תשובה.
+        </p>
+        {state.rep_question && <p className="text-xs text-ink-400">השאלה: {state.rep_question}</p>}
+      </div>
+    </div>
+  );
+}
+
 export function ComparisonDashboard(props: Props) {
   const { state } = props;
   const c = state?.last_comparison ?? null;
@@ -493,7 +533,9 @@ export function ComparisonDashboard(props: Props) {
 
   return (
     <section className="space-y-5" aria-label="השוואת נטו">
-      {c && c.is_eligible && c.net_alt !== null ? (
+      {state.waiting_for_rep ? (
+        <WaitingForRep state={state} />
+      ) : c && c.is_eligible && c.net_alt !== null ? (
         <>
           <Hero c={c} />
           <Breakdown c={c} />

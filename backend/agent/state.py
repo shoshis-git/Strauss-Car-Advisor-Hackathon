@@ -66,6 +66,9 @@ class ConversationState(BaseModel):
     rep_question: Optional[str] = None
     rep_field: Optional[str] = None  # state field the representative's answer fills
     last_comparison: Optional[dict[str, Any]] = None
+    # while waiting for the representative: today's net (engine) - "in the meantime, here is
+    # where you stand today"; the alternative follows when the answer arrives
+    today_preview: Optional[dict[str, Any]] = None
     # fail-fast eligibility of the requested alternative, checked as soon as the
     # occupation/group and the request are known - before any salary questions
     precheck: Optional[dict[str, Any]] = None
@@ -94,7 +97,7 @@ class ConversationState(BaseModel):
         self.display_name = None
         self.profile, self.current, self.target = (EmployeeProfile(), CurrentSituation(),
                                                    TargetChoice())
-        self.last_comparison = self.precheck = None
+        self.last_comparison = self.precheck = self.today_preview = None
         self.participation_unknown = None
         self.case_start = max((i for i, m in enumerate(self.messages) if m.role == "employee"),
                               default=len(self.messages))

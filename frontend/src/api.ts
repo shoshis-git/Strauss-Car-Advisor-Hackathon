@@ -73,6 +73,8 @@ export interface StateView {
   last_comparison: Comparison | null;
   /** fail-fast eligibility of the request, known before any salary data */
   precheck?: Precheck | null;
+  /** while waiting for the representative: today's net; the alternative follows the answer */
+  today_preview?: { today: Side; alternative_label: string | null } | null;
 }
 
 export interface Precheck {
