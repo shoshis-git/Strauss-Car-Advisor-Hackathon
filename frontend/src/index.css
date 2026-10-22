@@ -1,13 +1,74 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Heebo", "Assistant", "Segoe UI", "Arial Hebrew", Arial, sans-serif;
+  /* body: Noto Sans Hebrew (clean, modern); headings & numbers: Fredoka (rounded, friendly) */
+  --font-sans: "Noto Sans Hebrew", "Fredoka", "Segoe UI", "Arial Hebrew", Arial, sans-serif;
+  --font-display: "Fredoka", "Noto Sans Hebrew", "Segoe UI", Arial, sans-serif;
+
+  /* ink: soft plum-grey for text and lines */
+  --color-ink-50: #f7f5fb;
+  --color-ink-100: #efebf6;
+  --color-ink-200: #e2dcee;
+  --color-ink-300: #c9c1dc;
+  --color-ink-400: #a49cba;
+  --color-ink-500: #7d7596;
+  --color-ink-600: #5f5879;
+  --color-ink-700: #48425f;
+  --color-ink-900: #2a2540;
+
+  /* pastel palette */
+  --color-lilac-50: #f6f2ff;
+  --color-lilac-100: #ede5ff;
+  --color-lilac-200: #ddd0ff;
+  --color-lilac-300: #c6b3fb;
+  --color-lilac-400: #b49cf7;
+  --color-lilac-500: #9b7ff0;
+  --color-lilac-600: #7c5ee0;
+  --color-lilac-700: #5f43c0;
+
+  --color-mint-50: #effbf5;
+  --color-mint-100: #d9f5e7;
+  --color-mint-200: #b6ebd1;
+  --color-mint-300: #8fdcb8;
+  --color-mint-500: #4cc596;
+  --color-mint-700: #1f7d56;
+
+  --color-peach-50: #fff6f0;
+  --color-peach-100: #ffe8da;
+  --color-peach-200: #ffd4bb;
+  --color-peach-300: #ffb98f;
+  --color-peach-700: #a8501f;
+
+  --color-blush-50: #fff2f5;
+  --color-blush-100: #ffe1e8;
+  --color-blush-200: #ffc8d4;
+  --color-blush-500: #ee6f8d;
+  --color-blush-700: #b8355a;
+
+  --color-baby-50: #eff7ff;
+  --color-baby-100: #ddefff;
+  --color-baby-200: #c2e2fc;
+  --color-baby-300: #9fcdf5;
+  --color-baby-700: #2a6aa0;
+
+  --color-butter-50: #fffbec;
+  --color-butter-100: #fff3c7;
+  --color-butter-200: #ffe795;
+  --color-butter-700: #7f6200;
 }
 
 html,
 body {
-  background: var(--color-slate-50);
-  color: var(--color-slate-900);
+  min-height: 100%;
+  color: var(--color-ink-900);
+  background-color: #fbf8ff;
+  background-image:
+    radial-gradient(42rem 30rem at 100% 0%, rgb(221 208 255 / 0.75), transparent 70%),
+    radial-gradient(36rem 28rem at 0% 100%, rgb(255 212 187 / 0.55), transparent 70%),
+    radial-gradient(30rem 24rem at 15% 10%, rgb(182 235 209 / 0.45), transparent 70%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* Numbers with signs/currency keep their direction inside RTL text */
@@ -15,4 +76,31 @@ body {
   direction: ltr;
   unicode-bidi: isolate;
   font-variant-numeric: tabular-nums;
+}
+
+/* frosted white card used across both screens */
+.card {
+  border-radius: 1.75rem;
+  border: 1px solid rgb(255 255 255 / 0.9);
+  background: rgb(255 255 255 / 0.82);
+  box-shadow:
+    0 1px 0 rgb(255 255 255) inset,
+    0 12px 32px -14px rgb(110 86 180 / 0.22);
+  backdrop-filter: blur(14px);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  border-radius: 9999px;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+/* thin, quiet scrollbars inside panels */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-200) transparent;
 }

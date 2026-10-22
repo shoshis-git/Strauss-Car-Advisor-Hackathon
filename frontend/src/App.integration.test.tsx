@@ -149,6 +149,9 @@ describe.skipIf(!health)("App ↔ backend", () => {
       await screen.findByText("מפתח נציג חסר או שגוי", {}, T);
       fireEvent.change(screen.getByLabelText("מפתח נציג"), { target: { value: REP_KEY } });
       fireEvent.click(screen.getByRole("button", { name: "כניסה" }));
+      // master-detail: open this conversation's ticket (the newest; older ones may be pending)
+      const cards = await screen.findAllByRole("button", { name: /שיחה חופשית/ }, T);
+      fireEvent.click(cards[cards.length - 1]);
       const input = await screen.findByLabelText(/השתתפות מאושרת עבור/, {}, T);
       fireEvent.change(input, { target: { value: "350" } });
       fireEvent.click(screen.getByRole("button", { name: "שליחה וסגירת הפנייה" }));
