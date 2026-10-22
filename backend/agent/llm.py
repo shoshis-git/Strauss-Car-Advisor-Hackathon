@@ -20,16 +20,20 @@ what the automated tests use.
 """
 from __future__ import annotations
 
+import email.utils
 import http.client
 import json
 import logging
+import math
 import os
+import random
 import re
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
@@ -55,21 +59,39 @@ LITELLM = "litellm"
 
 
 TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+# worth asking the same provider again after a short wait (429 only with Retry-After)
+RETRY_STATUSES = {408, 500, 502, 503, 504}
 
 
 class LLMError(RuntimeError):
     """status: HTTP status from the provider; None = unreachable / malformed reply.
-    detail: the provider's own short explanation (safe to log - long tokens masked)."""
+    detail: the provider's own short explanation (safe to log - long tokens masked).
+    retry_after: seconds from the provider's Retry-After header, if it sent one.
+    retryable: overrides the status-based decision (e.g. True for a network error)."""
 
-    def __init__(self, message: str, status: Optional[int] = None, detail: str = ""):
+    def __init__(self, message: str, status: Optional[int] = None, detail: str = "",
+                 retry_after: Optional[float] = None, retryable: Optional[bool] = None):
         super().__init__(message)
         self.status = status
         self.detail = detail
+        self.retry_after = retry_after
+        self._retryable = retryable
 
     @property
     def transient(self) -> bool:
         """Quota, overload, outage or network - worth backing off rather than retrying now."""
         return self.status is None or self.status in TRANSIENT_STATUSES
+
+    @property
+    def retryable(self) -> bool:
+        """A short overload / outage / network blip: the same request may succeed in a few
+        seconds. A 429 only when the provider said when (Retry-After) - otherwise it is
+        usually an exhausted quota that no short wait fixes."""
+        if self._retryable is not None:
+            return self._retryable
+        if self.status == 429:
+            return self.retry_after is not None
+        return self.status in RETRY_STATUSES
 
     @property
     def user_message(self) -> str:
@@ -190,6 +212,26 @@ def provider_detail(body: str) -> str:
     return _LONG_TOKEN.sub("…", " ".join(str(text).split()))[:200]
 
 
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Retry-After header -> seconds to wait. It is either a number of seconds or an
+    HTTP date; anything unreadable is ignored (None)."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
 def http_post_json(url: str, headers: dict[str, str], body: dict[str, Any],
                    timeout: float) -> dict[str, Any]:
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
@@ -200,11 +242,12 @@ def http_post_json(url: str, headers: dict[str, str], body: dict[str, Any],
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")[:2000]
+        retry_after = parse_retry_after(e.headers.get("Retry-After") if e.headers else None)
         raise LLMError(f"LLM HTTP {e.code} from {url}: {raw[:500]}", status=e.code,
-                       detail=provider_detail(raw)) from e
+                       detail=provider_detail(raw), retry_after=retry_after) from e
     except urllib.error.URLError as e:
         raise LLMError(f"LLM endpoint unreachable ({url}): {e.reason}",
-                       detail=str(e.reason)[:200]) from e
+                       detail=str(e.reason)[:200], retryable=True) from e
     except TimeoutError as e:
         raise LLMError(f"LLM endpoint timed out ({url})", status=408, detail="timeout") from e
     except (UnicodeError, ValueError, OSError, http.client.HTTPException) as e:
@@ -249,17 +292,88 @@ def _adapt_history(messages: list[dict[str, Any]], label: str,
     return out
 
 
+MIN_ATTEMPT_S = 5.0  # no retry if less than this would be left of the time budget
+
+
+def _env_number(env: Any, name: str, default: float) -> float:
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise LLMError(f"{name} must be a number, got {raw!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise LLMError(f"{name} must be a non-negative number, got {raw!r}")
+    return value
+
+
+@dataclass
+class RetryPolicy:
+    """Retries of one provider on a short failure (503, 502, 500, 504, timeout, network,
+    429 with Retry-After), before FailoverLLM moves on to the next provider.
+
+    Wait before retry k (0-based): the provider's Retry-After if it sent one (no retry if
+    it asks for more than max_delay_s), otherwise a random time between 0 and
+    min(max_delay_s, base_delay_s * 2**k) ("full jitter", so many clients do not come back
+    at the same moment). All attempts and waits together stay within budget_s."""
+    max_retries: int = 3
+    base_delay_s: float = 1.0
+    max_delay_s: float = 16.0
+    budget_s: float = 90.0
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+    rand: Callable[[float, float], float] = random.uniform
+
+    @classmethod
+    def from_env(cls, env: Any = None) -> "RetryPolicy":
+        env = os.environ if env is None else env
+        return cls(max_retries=int(_env_number(env, "LLM_RETRY_MAX", cls.max_retries)),
+                   base_delay_s=_env_number(env, "LLM_RETRY_BASE_S", cls.base_delay_s),
+                   max_delay_s=_env_number(env, "LLM_RETRY_MAX_DELAY_S", cls.max_delay_s),
+                   budget_s=_env_number(env, "LLM_RETRY_BUDGET_S", cls.budget_s))
+
+    def delay(self, retry: int, error: LLMError) -> Optional[float]:
+        """Seconds to wait before retry number `retry`; None = do not retry."""
+        if error.retry_after is not None:
+            return error.retry_after if error.retry_after <= self.max_delay_s else None
+        return self.rand(0.0, min(self.max_delay_s, self.base_delay_s * 2 ** retry))
+
+    def run(self, call: Callable[[float], Any], timeout: float, label: str = "") -> Any:
+        """call(timeout) until it succeeds, fails for good, or the budget runs out.
+        The request timeout shrinks to what is left of the budget."""
+        deadline = self.clock() + self.budget_s
+        retry = 0
+        while True:
+            remaining = deadline - self.clock()
+            try:
+                return call(max(MIN_ATTEMPT_S, min(timeout, remaining)))
+            except LLMError as e:
+                if retry >= self.max_retries or not e.retryable:
+                    raise
+                wait = self.delay(retry, e)
+                if wait is None or self.clock() + wait > deadline - MIN_ATTEMPT_S:
+                    raise
+                retry += 1
+                log.warning("LLM %s failed (status %s: %s) - retry %d/%d in %.1fs",
+                            label or "-", e.status, e.detail or "-", retry,
+                            self.max_retries, wait)
+                self.sleep(wait)
+
+
 class OpenAICompatibleLLM:
     """Any endpoint that speaks Chat Completions with tool calling."""
 
     def __init__(self, model: str, base_url: str, api_key: Optional[str] = None,
                  temperature: float = 0.0, max_tokens: int = 2048, timeout: float = 60.0,
-                 transport: Transport = http_post_json, provider: str = "openai_compatible"):
+                 transport: Transport = http_post_json, provider: str = "openai_compatible",
+                 retry: Optional[RetryPolicy] = None):
         self.model, self.base_url = model, base_url.rstrip("/")
         self.api_key = Secret(api_key) if api_key else None
         self.temperature, self.max_tokens, self.timeout = temperature, max_tokens, timeout
         self.transport = transport
         self.provider = provider
+        self.retry = retry or RetryPolicy.from_env()
 
     @property
     def label(self) -> str:
@@ -279,8 +393,10 @@ class OpenAICompatibleLLM:
 
     def step(self, *, system, messages, tools, state) -> LLMStep:
         headers = {"Authorization": Secret(f"Bearer {self.api_key}")} if self.api_key else {}
-        data = self.transport(f"{self.base_url}/chat/completions", headers,
-                              self.request_body(system, messages, tools), self.timeout)
+        url = f"{self.base_url}/chat/completions"
+        body = self.request_body(system, messages, tools)
+        data = self.retry.run(lambda timeout: self.transport(url, headers, body, timeout),
+                              self.timeout, self.label)
         step = parse_completion(data)
         step.assistant_message[ORIGIN_KEY] = self.label
         return step

@@ -30,6 +30,26 @@ def _first(patterns: list[str], text: str) -> Optional[float]:
     return None
 
 
+# words that may sit between a label and its amount: "עמלות משתנות כ-1,000"
+AMOUNT_FILLER = (r"(?:\s+(?:משתנות|משתנים|חודשיות|חודשיים|בחודש|בערך|בסביבות|בסך|של|הן|הם))*"
+                 r"\s*[:\-]?\s*(?:כ\s*-?\s*|כ־\s*)?")
+# a shekel amount said on its own, e.g. "קבוצה ג, 14,200 ₪"
+_BARE_SHEKELS = re.compile(NUM + r"\s*(?:₪|ש\"ח|ש״ח|שקל(?:ים)?)")
+# any of these before the amount means it belongs to something else
+_OTHER_MONEY = re.compile(r"עמל|בונוס|השתתפ|אחזק|שווי|פנסי|השתלמ|זיכוי|נטו|ברוטו|מחיר|עלות|תקציב|החזר")
+MIN_BARE_SALARY = 2000  # smaller amounts are participations / allowances, not a salary
+
+
+def _bare_salary(text: str) -> Optional[float]:
+    """A single shekel amount with no label, as an answer to "what is your base salary"."""
+    hits = [m for m in _BARE_SHEKELS.finditer(text)
+            if not _OTHER_MONEY.search(text[max(0, m.start() - 25):m.start()])]
+    if len(hits) != 1:
+        return None  # none, or ambiguous - ask instead of guessing
+    v = _num(hits[0].group(1))
+    return v if v >= MIN_BARE_SALARY else None
+
+
 TARGET_CUES = r"(לעבור|אעבור|להחליף|אחליף|לקחת|אקח|רוצה|מבקש|מבקשת|שוקל|שוקלת|מעוניין|מעוניינת|ל-|ל־)"
 CURRENT_CUES = r"(יש לי|נוהג|נוהגת|נוסע|נוסעת|נוכחי|היום|כרגע)"
 REP_CUES = r"(לא\s*(?:יודע|יודעת|בטוח|בטוחה)|מיוחדת|חריגה)"
@@ -41,6 +61,8 @@ def extract_fields(text: str, state: ConversationState, config: AppConfig) -> di
     f: dict[str, Any] = {}
 
     v = _first([r"(?:שכר|משכורת)\s*(?:ה?בסיס\s*)?(?:שלי\s*)?(?:הוא\s*)?(?:של\s*)?[:\-]?\s*" + NUM], text)
+    if v is None and state.profile.base_salary is None:
+        v = _bare_salary(text)  # "קבוצה ג, 14,200 ₪" - the answer to the salary question
     if v is not None:
         f["base_salary"] = v
 
@@ -51,8 +73,8 @@ def extract_fields(text: str, state: ConversationState, config: AppConfig) -> di
     if occ:
         f["occupation"] = occ
 
-    commissions = _first([r"עמלות\s*(?:של\s*)?" + NUM], text)
-    bonus = _first([r"בונוס\s*(?:של\s*)?" + NUM], text)
+    commissions = _first([r"עמלות" + AMOUNT_FILLER + NUM], text)
+    bonus = _first([r"בונוס(?:ים)?" + AMOUNT_FILLER + NUM], text)
     if commissions is not None or bonus is not None:
         f["commissions_bonuses"] = (commissions or 0) + (bonus or 0)
     elif re.search(r"(?:אין|בלי|ללא)\s*(?:לי\s*)?(?:עמלות|בונוס)", text):

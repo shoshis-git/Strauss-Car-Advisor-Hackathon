@@ -290,60 +290,90 @@ def test_deterministic_brain_has_no_vision():
 # --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
+SECRET = "test-secret-key-0123456789-abcdefghijklmnop"
+
+
+def _app(db_path, llm):
+    return create_app(db_path=db_path, llm=llm, rep_token="test-rep-key-0123456789",
+                      secret_key=SECRET)
+
+
+def login(client) -> tuple[str, dict]:
+    """A guest login: (session id, Authorization header) - every payslip call needs it."""
+    j = client.post("/api/auth/login", json={"guest": True}).json()
+    return j["session_id"], {"Authorization": f"Bearer {j['token']}"}
+
+
 @pytest.fixture
 def client(tmp_path):
-    with TestClient(create_app(db_path=tmp_path / "api.db", llm=RuleBasedLLM(CONFIG),
-                               rep_token="test-rep-key-0123456789")) as c:
+    with TestClient(_app(tmp_path / "api.db", RuleBasedLLM(CONFIG))) as c:
         yield c
 
 
-def test_extract_endpoint_returns_proposals_and_stores_nothing(client):
-    r = client.post("/api/payslip/extract", content=E004_PDF, headers=PDF)
+@pytest.fixture
+def auth(client):
+    return login(client)[1]
+
+
+def test_extract_endpoint_returns_proposals_and_stores_nothing(client, auth):
+    import sqlite3
+    with sqlite3.connect(client.app.state.agent.store.db_path) as db:
+        before = db.execute("select state_json from conversations").fetchall()
+    r = client.post("/api/payslip/extract", content=E004_PDF, headers={**PDF, **auth})
     assert r.status_code == 200, r.text
     body = r.json()
     assert {f["field"]: f["value"] for f in body["fields"]}["base_salary"] == 16000
     assert all(s not in r.text for s in PRIVATE)
     assert client.app.state.agent.store.waiting_for_rep() == []
-    import sqlite3
+    # the upload changed nothing: only the login's conversation exists, untouched
     with sqlite3.connect(client.app.state.agent.store.db_path) as db:
-        assert db.execute("select count(*) from conversations").fetchone()[0] == 0
+        assert db.execute("select state_json from conversations").fetchall() == before
+
+
+def test_extract_endpoint_requires_a_login(client):
+    assert client.post("/api/payslip/extract", content=E004_PDF, headers=PDF).status_code == 401
 
 
 @pytest.mark.parametrize("content, headers, status", [
     (E004_PDF, {"Content-Type": "image/png"}, 415),
     (b"%PDF-" + b"0" * MAX_BYTES, PDF, 413),
 ], ids=["png", "too-big"])
-def test_extract_endpoint_rejects_bad_uploads(client, content, headers, status):
-    r = client.post("/api/payslip/extract", content=content, headers=headers)
+def test_extract_endpoint_rejects_bad_uploads(client, auth, content, headers, status):
+    r = client.post("/api/payslip/extract", content=content, headers={**headers, **auth})
     assert r.status_code == status and r.json()["detail"]
 
 
 def test_confirmed_payslip_then_cars_reproduces_the_excel_reference(client):
     """E-004 end to end: payslip -> confirm -> one message about the cars."""
-    fields = client.post("/api/payslip/extract", content=E004_PDF, headers=PDF).json()["fields"]
+    sid, auth = login(client)
+    fields = client.post("/api/payslip/extract", content=E004_PDF,
+                         headers={**PDF, **auth}).json()["fields"]
     applied = client.post("/api/payslip/apply", json={
-        "values": {f["field"]: f["value"] for f in fields}})
+        "values": {f["field"]: f["value"] for f in fields}}, headers=auth)
     assert applied.status_code == 200, applied.text
     a = applied.json()
-    sid = a["session_id"]
+    assert a["session_id"] == sid
     p = a["state"]["profile"]
     assert (p["base_salary"], p["pension_pct"], p["credit_points"], p["eligibility_group"]) == (
         16000, 6, 2.25, "ג")
     assert a["state"]["current"]["current_participation"] == 400
-    msgs = client.get(f"/api/session/{sid}").json()["messages"]
-    assert msgs[0]["role"] == "employee" and "אישרתי את הנתונים מתלוש השכר" in msgs[0]["content"]
+    msgs = client.get(f"/api/session/{sid}", headers=auth).json()["messages"]
+    assert msgs[0]["role"] == "assistant"  # the login greeting
+    assert msgs[1]["role"] == "employee" and "אישרתי את הנתונים מתלוש השכר" in msgs[1]["content"]
 
     r = client.post("/api/chat", json={"session_id": sid,
-                                       "message": "היום יש לי טוסון ואני רוצה לעבור ל-EV3"})
+                                       "message": "היום יש לי טוסון ואני רוצה לעבור ל-EV3"},
+                    headers=auth)
     c = r.json()["state"]["last_comparison"]
     ref = CONFIG.reference_calculation("E-004")
     assert (c["net_today"], c["net_alt"], c["net_diff"]) == (
         ref.net_current, ref.net_alternative, ref.net_diff)
 
 
-def test_employee_corrections_win_over_the_payslip(client):
+def test_employee_corrections_win_over_the_payslip(client, auth):
     r = client.post("/api/payslip/apply", json={"values": {"base_salary": 16500,
-                                                           "credit_points": 2.75}})
+                                                           "credit_points": 2.75}},
+                    headers=auth)
     assert r.json()["state"]["profile"]["base_salary"] == 16500
 
 
@@ -353,15 +383,17 @@ def test_employee_corrections_win_over_the_payslip(client):
     {"values": {"base_salary": 1, "iban": "IL12"}},    # unknown field
     {"session_id": "nope", "values": {"base_salary": 9000}},
 ])
-def test_apply_validation(client, body):
-    assert client.post("/api/payslip/apply", json=body).status_code == 422
+def test_apply_validation(client, auth, body):
+    assert client.post("/api/payslip/apply", json=body, headers=auth).status_code == 422
 
 
 def test_unreadable_pdf_asks_the_employee_before_any_image_is_sent(tmp_path, monkeypatch):
     monkeypatch.delenv("PAYSLIP_VISION", raising=False)
     llm = VisionLLM(VISION_ANSWER)
-    with TestClient(create_app(db_path=tmp_path / "v.db", llm=llm)) as c:
-        first = c.post("/api/payslip/extract", content=GLYPH_PDF, headers=PDF)
+    with TestClient(_app(tmp_path / "v.db", llm)) as c:
+        _, auth = login(c)
+        PDF_AUTH = {**PDF, **auth}
+        first = c.post("/api/payslip/extract", content=GLYPH_PDF, headers=PDF_AUTH)
         assert first.status_code == 200, first.text
         body = first.json()
         assert "קידוד פנימי של הגופן" in body["unreadable"] and body["vision_available"]
@@ -369,7 +401,7 @@ def test_unreadable_pdf_asks_the_employee_before_any_image_is_sent(tmp_path, mon
         assert llm.sent == []  # nothing went to the model yet
 
         # the employee agreed: the browser sends the same file again with ?vision=1
-        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers=PDF)
+        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers=PDF_AUTH)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["source"] == "image" and body["unreadable"] is None
@@ -378,29 +410,33 @@ def test_unreadable_pdf_asks_the_employee_before_any_image_is_sent(tmp_path, mon
                                                                  "credit_points": 2.75}
 
 
-def test_unreadable_pdf_without_vision_offers_only_the_chat(client):
-    body = client.post("/api/payslip/extract", content=SCANNED_PDF, headers=PDF).json()
+def test_unreadable_pdf_without_vision_offers_only_the_chat(client, auth):
+    body = client.post("/api/payslip/extract", content=SCANNED_PDF,
+                       headers={**PDF, **auth}).json()
     assert "סריקה" in body["unreadable"] and body["vision_available"] is False
 
 
 def test_image_reading_refused_when_switched_off(tmp_path, monkeypatch):
     monkeypatch.setenv("PAYSLIP_VISION", "off")
     llm = VisionLLM(VISION_ANSWER)
-    with TestClient(create_app(db_path=tmp_path / "v.db", llm=llm)) as c:
-        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers=PDF)
+    with TestClient(_app(tmp_path / "v.db", llm)) as c:
+        _, auth = login(c)
+        r = c.post("/api/payslip/extract?vision=1", content=GLYPH_PDF, headers={**PDF, **auth})
         assert r.status_code == 403 and "PAYSLIP_VISION" in r.json()["detail"]
-        body = c.post("/api/payslip/extract", content=GLYPH_PDF, headers=PDF).json()
+        body = c.post("/api/payslip/extract", content=GLYPH_PDF, headers={**PDF, **auth}).json()
         assert body["vision_available"] is False
     assert llm.sent == []
 
 
-def test_apply_to_unknown_or_frozen_session(client):
+def test_apply_to_another_or_frozen_session(client):
+    sid, auth = login(client)
+    # another conversation's id: refused by the token check
     assert client.post("/api/payslip/apply", json={
-        "session_id": "0" * 32, "values": {"base_salary": 9000}}).status_code == 404
-    sid = client.post("/api/chat", json={
-        "message": "אני רוצה לעבור ל-EV3 אבל סוכמה לי השתתפות מיוחדת ואני לא יודע כמה"}
-    ).json()["session_id"]
-    assert client.get(f"/api/session/{sid}").json()["state"]["waiting_for_rep"]
+        "session_id": "0" * 32, "values": {"base_salary": 9000}}, headers=auth).status_code == 403
+    client.post("/api/chat", json={
+        "message": "אני רוצה לעבור ל-EV3 אבל סוכמה לי השתתפות מיוחדת ואני לא יודע כמה"},
+        headers=auth)
+    assert client.get(f"/api/session/{sid}", headers=auth).json()["state"]["waiting_for_rep"]
     r = client.post("/api/payslip/apply", json={"session_id": sid,
-                                                "values": {"base_salary": 9000}})
+                                                "values": {"base_salary": 9000}}, headers=auth)
     assert r.status_code == 409

@@ -441,6 +441,112 @@ def _side_breakdown(res, config: AppConfig) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# All my options: every permitted alternative, ranked by the engine
+# --------------------------------------------------------------------------- #
+RANKING_FIELDS = ("base_salary", "eligibility_group", "commissions_bonuses", "pension_pct",
+                  "hishtalmut_pct", "credit_points")
+
+
+def ranking_missing(state: ConversationState) -> list[str]:
+    """What the ranking needs: the pay data and today's situation (no requested
+    alternative - the ranking is what helps choose one)."""
+    p, cur = state.profile, state.current
+    missing = [f for f in RANKING_FIELDS if getattr(p, f) is None]
+    if cur.status is None:
+        missing.append("current_car_code")
+    elif cur.status == "car" and cur.current_participation is None:
+        missing.append("current_participation")
+    elif cur.status == WAIVER and cur.current_maintenance is None and not p.occupation:
+        missing.append("occupation")
+    return missing
+
+
+def rank_alternatives(state: ConversationState, config: AppConfig) -> dict:
+    """Net pay for every alternative the employee may choose - each permitted car, the
+    family track (if eligible) and a waiver (if the occupation allows it) - sorted by the
+    monthly net difference. Read-only: the conversation state is not changed."""
+    missing = ranking_missing(state)
+    if missing:
+        return {"ok": False, "missing_info": missing,
+                "missing_labels": [FIELD_LABELS[f] for f in missing]}
+    p, cur = state.profile, state.current
+    emp = build_employee(state, config)
+    family_cars = set(config.rules.family_track.cars)
+    budget = config.rules.budget(p.eligibility_group)
+    r = lambda v: display_round(v, config.rules)  # noqa: E731
+
+    requests: list[AlternativeRequest] = [
+        AlternativeRequest.car(c.car_id) for c in config.cars
+        if not (cur.status == "car" and c.car_id == cur.current_car_code)]
+    notes: list[str] = []
+    if cur.status != WAIVER:
+        if p.occupation:
+            requests.append(AlternativeRequest.waiver())
+        else:
+            notes.append("כדי לבדוק גם ויתור על הרכב צריך לדעת את העיסוק")
+    if p.children_count is None:
+        notes.append("כדי לבדוק את מסלול ברוכת ילדים צריך את מספר הילדים עד גיל 23")
+
+    rows: list[dict[str, Any]] = []
+    net_today = None
+    current_label = None
+    for req in requests:
+        if req.kind == "car" and req.car_id in family_cars and p.children_count is None:
+            continue
+        c = compare(config, emp, req)
+        net_today, current_label = c.net_today, c.current_label
+        if not c.is_eligible:
+            continue
+        sc = c.alternative.scenario
+        car = config.car(req.car_id) if req.kind == "car" else None
+        rows.append({
+            "kind": sc.kind,
+            "car_id": sc.car_id,
+            "label": sc.label,
+            "model_name": car.model_name if car else "ויתור על הרכב",
+            "group": car.group if car else None,
+            "drive": car.drive if car else None,
+            "family_track": bool(car and car.car_id in family_cars),
+            "is_electric": sc.is_electric,
+            "company_monthly_cost": car.company_monthly_cost if car else None,
+            "value_of_use": r(sc.value_of_use),
+            "participation": r(sc.participation),
+            "maintenance_allowance": r(sc.maintenance_allowance),
+            "family_gap_deduction": r(sc.family_gap_deduction),
+            "net_alt": c.net_alt,
+            "net_diff": c.net_diff,
+            "explanation": c.explanation,
+        })
+    if net_today is None:  # nothing to compare against (should not happen with a catalogue)
+        return {"ok": False, "error": "אין חלופות לבדיקה"}
+
+    # best first; equal nets: the lower value of use (less taxable income) first
+    rows.sort(key=lambda x: (-x["net_diff"], x["value_of_use"]))
+    tgt = state.target
+    for i, row in enumerate(rows, 1):
+        row["rank"] = i
+        row["is_selected"] = (
+            (row["kind"] == WAIVER and tgt.target_action == WAIVER)
+            or (row["car_id"] is not None and row["car_id"] == tgt.target_car_code))
+    best_electric = next((x for x in rows if x["is_electric"]), None)
+    return {
+        "ok": True,
+        "current_label": current_label,
+        "net_today": net_today,
+        "group": p.eligibility_group,
+        "budget": budget,
+        "count": len(rows),
+        "best": rows[0] if rows else None,
+        "best_electric": best_electric,
+        "options": rows,
+        "notes": notes,
+        # every row uses the catalogue participation - a rep-approved amount for one
+        # specific car is not carried over to the others
+        "participation_source": "company_catalogue_default",
+    }
+
+
 def start_new_case(state: ConversationState, config: AppConfig) -> dict:
     """The employee moves to a new question about another employee / scenario."""
     state.reset_case()
@@ -465,6 +571,7 @@ TOOLS: dict[str, Callable[..., dict]] = {
     "update_profile": update_profile,
     "get_allowed_cars": get_allowed_cars,
     "calculate_comparison": calculate_comparison,
+    "rank_alternatives": rank_alternatives,
     "ask_representative": ask_representative,
     "start_new_case": start_new_case,
 }
@@ -513,6 +620,15 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "name": "calculate_comparison",
         "description": "חישוב נטו היום מול נטו בחלופה, ההפרש וההסבר. "
                        "אם חסרים נתונים - מחזיר את רשימת החסרים.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "rank_alternatives",
+        "description": "כל האפשרויות של העובד: הנטו לכל רכב מותר, למסלול ברוכת ילדים "
+                       "(אם זכאי) ולוויתור (אם מותר), מדורגות מהמשתלם ביותר. לשאלות כמו "
+                       "'מה הכי משתלם לי?' או 'איזה רכב חשמלי הכי כדאי?'. לא משנה את החלופה "
+                       "שנבחרה. דורש נתוני שכר ומצב נוכחי; אם חסרים - מחזיר את רשימת החסרים. "
+                       "ההשתתפות בכל חלופה היא לפי טבלת הרכבים של החברה.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {

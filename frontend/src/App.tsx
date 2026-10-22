@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, API_BASE, ApiError, getRepKey, type DemoEmployee } from "./api";
+import {
+  api,
+  API_BASE,
+  ApiError,
+  getAuth,
+  getRepKey,
+  LOGOUT_EVENT,
+  setAuth,
+  type Auth,
+  type DemoEmployee,
+} from "./api";
 import { EmployeeScreen } from "./components/EmployeeScreen";
+import { LoginScreen } from "./components/LoginScreen";
 import { RepDashboard } from "./components/RepDashboard";
 
 type Tab = "employee" | "rep";
+
+const CONNECT_RETRIES = 15; // x 5s = up to ~75s, enough for a cold start
+const CONNECT_RETRY_MS = 5000;
+const WAKING_STATUSES = [0, 502, 503, 504]; // network error / gateway while the server wakes
 
 function Logo() {
   return (
@@ -22,16 +37,62 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("employee");
   const [demo, setDemo] = useState<DemoEmployee[]>([]);
   const [backendError, setBackendError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [attempt, setAttempt] = useState(0); // bump to retry the connection
   const [ticketCount, setTicketCount] = useState(0);
   const [repAuthed, setRepAuthed] = useState(() => getRepKey() !== null);
   const onCount = useCallback((n: number) => setTicketCount(n), []);
-
-  useEffect(() => {
-    api
-      .catalog()
-      .then((c) => setDemo(c.demo_employees))
-      .catch((e) => setBackendError(e instanceof ApiError ? e.message : String(e)));
+  // employee login (token in sessionStorage - survives a refresh of this tab)
+  const [auth, setAuthState] = useState<Auth | null>(getAuth);
+  const login = useCallback((a: Auth) => {
+    setAuth(a);
+    setAuthState(a);
   }, []);
+  const logout = useCallback(() => {
+    setAuth(null);
+    setAuthState(null);
+  }, []);
+  // the server refused the token (expired / server key changed): back to the login screen
+  useEffect(() => {
+    const onLogout = () => setAuthState(null);
+    window.addEventListener(LOGOUT_EVENT, onLogout);
+    return () => window.removeEventListener(LOGOUT_EVENT, onLogout);
+  }, []);
+
+  // A cloud server on a free plan sleeps when idle; the first request can fail or hang
+  // while it wakes up (~30-60s). Retry quietly before showing an error.
+  useEffect(() => {
+    let cancelled = false;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // a waking server may also just hold the request: show the notice if it is slow
+    const slow = setTimeout(() => !cancelled && setConnecting(true), 1500);
+    (async () => {
+      setBackendError(null);
+      for (let i = 0; i < CONNECT_RETRIES; i++) {
+        try {
+          const c = await api.catalog();
+          if (!cancelled) setDemo(c.demo_employees);
+          break;
+        } catch (e) {
+          const waking = e instanceof ApiError && WAKING_STATUSES.includes(e.status);
+          if (cancelled) return;
+          if (!waking || i === CONNECT_RETRIES - 1) {
+            setBackendError(e instanceof ApiError ? e.message : String(e));
+            break;
+          }
+          setConnecting(true);
+          await sleep(CONNECT_RETRY_MS);
+          if (cancelled) return;
+        }
+      }
+      clearTimeout(slow);
+      if (!cancelled) setConnecting(false);
+    })();
+    return () => {
+      cancelled = true;
+      clearTimeout(slow);
+    };
+  }, [attempt]);
 
   // keep the rep badge fresh while on the employee tab (only once a rep key was entered)
   useEffect(() => {
@@ -103,16 +164,41 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-7xl px-5 py-6">
+        {connecting && !backendError && (
+          <div className="mb-4 flex items-center gap-3 rounded-3xl border border-lilac-200 bg-lilac-50 p-4 text-sm text-ink-700" role="status">
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-lilac-300 border-t-transparent" aria-hidden="true" />
+            מתחברים לשרת... בפתיחה הראשונה זה יכול לקחת עד דקה.
+          </div>
+        )}
         {backendError && (
           <div className="mb-4 rounded-3xl border border-blush-200 bg-blush-50 p-4 text-sm text-blush-700" role="alert">
-            לא ניתן להתחבר לשרת ב-<span className="num">{API_BASE}</span>: {backendError}
-            <br />
-            הפעילו את ה-backend: <code className="num">uvicorn backend.main:app --reload --port 8000</code>
+            {import.meta.env.DEV ? (
+              <>
+                לא ניתן להתחבר לשרת ב-<span className="num">{API_BASE}</span>: {backendError}
+                <br />
+                הפעילו את ה-backend: <code className="num">uvicorn backend.main:app --reload --port 8000</code>
+              </>
+            ) : (
+              <>לא הצלחנו להתחבר לשירות כרגע. {backendError}</>
+            )}
+            <div className="mt-3">
+              <button
+                type="button"
+                className="rounded-full bg-white px-4 py-1.5 font-medium text-blush-700 shadow-sm ring-1 ring-blush-200 hover:bg-blush-100"
+                onClick={() => setAttempt((n) => n + 1)}
+              >
+                נסו שוב
+              </button>
+            </div>
           </div>
         )}
         {/* both screens stay mounted so switching tabs keeps the conversation */}
         <div hidden={tab !== "employee"}>
-          <EmployeeScreen demoEmployees={demo} />
+          {auth ? (
+            <EmployeeScreen key={auth.session_id} auth={auth} onLogout={logout} />
+          ) : (
+            <LoginScreen demoEmployees={demo} onLogin={login} />
+          )}
         </div>
         <div hidden={tab !== "rep"}>
           {tab === "rep" && <RepDashboard onCountChange={onCount} onAuthChange={setRepAuthed} />}

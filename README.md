@@ -13,6 +13,8 @@
 
 ## ארכיטקטורה
 
+הסבר מפורט, כולל תרשימים ומנגנוני ההגנה מפני המצאות: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```
  Frontend (React + Vite)  ──HTTP──►  Backend (FastAPI)
    מסך עובד / מסך נציג                │
@@ -95,6 +97,7 @@ npm run dev                       # http://localhost:5173
 | `LLM_BASE_URL` | כתובת חלופית; חובה עבור `openai_compatible` |
 | `LLM_PROVIDER_2` ... `_5` | ספקים לגיבוי: אם אחד נכשל (מכסה, קרדיט, תקלה), הבא בתור עונה |
 | `LLM_FALLBACK` | `none` (ברירת מחדל): העובד רואה את סיבת התקלה. `rules`: המוח הדטרמיניסטי עונה במקום המודל |
+| `SECRET_KEY` | חתימת טוקני הכניסה של העובדים. אם הוא ריק, נוצר מפתח אקראי בכל הפעלה, וכולם צריכים להיכנס מחדש. החלפה שלו מנתקת את כולם |
 | `REP_API_KEY` | מפתח מסך הנציג (נשלח בכותרת `X-Rep-Token`). אם הוא ריק, מסך הנציג סגור |
 | `PAYSLIP_VISION` | `on`: תלוש בלי טקסט קריא (סריקה) נקרא מתמונת העמוד על ידי המודל |
 | `DATABASE_URL` | אם הוא ריק, השיחות נשמרות ב-SQLite מקומית. בייצור: ה-URI של ה-Transaction pooler ב-Supabase |
@@ -120,10 +123,12 @@ cd frontend && npm test           # frontend: Vitest + Testing Library
 |---|---|---|
 | GET | `/api/health` | בדיקת חיים |
 | GET | `/api/catalog` | קטלוג רכבים ועובדי דמו |
-| POST | `/api/chat` | הודעת עובד והתשובה של היועץ |
-| GET | `/api/session/{id}` | מצב שיחה |
-| POST | `/api/demo/{E-001}` | טעינת עובד לדוגמה |
+| POST | `/api/auth/login` | כניסה: `{emp_id, code}` (עובדי הדמו: קוד 1234) או `{guest: true}`. מחזיר טוקן חתום שקשור לשיחה חדשה |
+| POST | `/api/chat` | הודעת עובד והתשובה של היועץ (דורש טוקן) |
+| GET | `/api/session/{id}` | מצב שיחה (דורש טוקן של אותה שיחה) |
+| POST | `/api/demo/{E-001}` | השאלה המקורית של עובד הדמו מהאקסל, בשיחה של אותו עובד (דורש טוקן שלו) |
 | GET / POST | `/api/session/{id}/options`, `/alternative` | בחירת חלופה |
+| GET | `/api/session/{id}/ranking` | כל האפשרויות: הנטו לכל חלופה מותרת, מדורג מהמשתלם ביותר |
 | POST | `/api/payslip/extract`, `/api/payslip/apply` | העלאת תלוש ואישור הערכים |
 | GET | `/api/rep/tickets` | פניות שממתינות לנציג (דורש `X-Rep-Token`) |
 | POST | `/api/rep/tickets/{id}/answer` | תשובת נציג; השיחה ממשיכה (דורש `X-Rep-Token`) |

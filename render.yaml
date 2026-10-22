@@ -30,3 +30,6 @@ services:
         value: none
       - key: REP_API_KEY
         generateValue: true
+      # signs employee login tokens
+      - key: SECRET_KEY
+        generateValue: true

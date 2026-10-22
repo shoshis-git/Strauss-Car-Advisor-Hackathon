@@ -8,32 +8,16 @@ import {
   type StateView,
 } from "./api";
 
-const STORAGE_KEY = "car-advisor.session";
 const POLL_MS = 3000;
-
-function readStored(): string | null {
-  try {
-    return localStorage.getItem(STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-function writeStored(id: string | null) {
-  try {
-    if (id) localStorage.setItem(STORAGE_KEY, id);
-    else localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    /* storage unavailable - session simply won't survive a refresh */
-  }
-}
 
 function isPdf(file: File): boolean {
   return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 }
 
-/** Employee conversation: server is the source of truth, refreshed after every action. */
-export function useEmployeeSession() {
-  const [sessionId, setSessionId] = useState<string | null>(readStored);
+/** The logged-in employee's conversation: the server is the source of truth, refreshed
+ *  after every action. The conversation was opened at login (sessionId comes with the
+ *  token); after a browser refresh it is simply reloaded. */
+export function useEmployeeSession(sessionId: string) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [state, setState] = useState<StateView | null>(null);
   const [busy, setBusy] = useState(false);
@@ -43,16 +27,11 @@ export function useEmployeeSession() {
   const [payslip, setPayslip] = useState<PayslipExtraction | null>(null);
   const payslipFile = useRef<File | null>(null);
   const activeId = useRef(sessionId);
-
-  const adopt = useCallback((id: string | null) => {
-    activeId.current = id;
-    setSessionId(id);
-    writeStored(id);
-  }, []);
+  activeId.current = sessionId;
 
   const refresh = useCallback(async (id: string) => {
     const s = await api.session(id);
-    if (activeId.current !== id) return; // user switched session meanwhile
+    if (activeId.current !== id) return; // logged out / switched meanwhile
     // one render: chat and dashboard never show different moments of the conversation
     setMessages(s.messages);
     setState(s.state);
@@ -70,20 +49,14 @@ export function useEmployeeSession() {
     }
   }, []);
 
-  // Recover the stored conversation after a browser refresh.
+  // Load the conversation (right after login, and after a browser refresh).
   useEffect(() => {
-    const id = activeId.current;
-    if (!id) return;
-    refresh(id).catch((e) => {
-      // 404 = gone; 422 = an old-format id from before server-generated ids
-      if (e instanceof ApiError && (e.status === 404 || e.status === 422)) adopt(null);
-      else setError(e instanceof ApiError ? e.message : String(e));
-    });
-  }, [refresh, adopt]);
+    refresh(sessionId).catch((e) => setError(e instanceof ApiError ? e.message : String(e)));
+  }, [sessionId, refresh]);
 
   // While waiting for a representative, poll until the answer arrives.
   useEffect(() => {
-    if (!sessionId || !state?.waiting_for_rep) return;
+    if (!state?.waiting_for_rep) return;
     const t = setInterval(() => {
       refresh(sessionId).catch(() => undefined);
     }, POLL_MS);
@@ -100,35 +73,18 @@ export function useEmployeeSession() {
         };
         setMessages((m) => [...m, optimistic]);
         const r = await api.chat(text, activeId.current);
-        adopt(r.session_id);
         setNotice(r.notice ?? null);
         // state + messages are applied together by refresh (dashboard and chat stay in step)
-        await refresh(r.session_id);
+        await refresh(activeId.current);
       }),
-    [run, adopt, refresh],
-  );
-
-  const loadDemo = useCallback(
-    (empId: string) =>
-      run(async () => {
-        adopt(null);
-        setPayslip(null);
-        setMessages([]);
-        setState(null);
-        const r = await api.loadDemo(empId); // the server opens a new conversation
-        adopt(r.session_id);
-        await refresh(r.session_id);
-      }),
-    [run, adopt, refresh],
+    [run, refresh],
   );
 
   const setAlternative = useCallback(
     (choice: { car_id: string } | { waiver: true }) =>
       run(async () => {
-        const id = activeId.current;
-        if (!id) return;
-        await api.setAlternative(id, choice);
-        await refresh(id);
+        await api.setAlternative(activeId.current, choice);
+        await refresh(activeId.current);
       }),
     [run, refresh],
   );
@@ -164,27 +120,16 @@ export function useEmployeeSession() {
         const r = await api.applyPayslip(activeId.current, values);
         setPayslip(null);
         payslipFile.current = null;
-        adopt(r.session_id);
         setNotice(r.notice ?? null);
-        await refresh(r.session_id);
+        await refresh(activeId.current);
       }),
-    [run, adopt, refresh],
+    [run, refresh],
   );
 
   const cancelPayslip = useCallback(() => {
     setPayslip(null);
     payslipFile.current = null;
   }, []);
-
-  const reset = useCallback(() => {
-    adopt(null);
-    setMessages([]);
-    setState(null);
-    setError(null);
-    setNotice(null);
-    setPayslip(null);
-    payslipFile.current = null;
-  }, [adopt]);
 
   return {
     sessionId,
@@ -195,9 +140,7 @@ export function useEmployeeSession() {
     notice,
     payslip,
     send,
-    loadDemo,
     setAlternative,
-    reset,
     uploadPayslip,
     readPayslipImage,
     confirmPayslip,

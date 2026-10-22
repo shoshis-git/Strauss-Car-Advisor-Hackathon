@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from .agent.graph import AdvisorAgent
 from .agent.llm import LLMClient, LLMError, load_env_file, make_llm, read_env_file
 from .agent.state import make_state_store
+from .api.auth import DemoAccess, LoginThrottle, load_secret
 from .api.routes import SessionLocks, rep_router, router
 from .data_loader.config_loader import get_config
 from .data_loader.tax_loader import get_tax_db
@@ -39,8 +40,9 @@ SECURITY_HEADERS = {
 
 
 def create_app(db_path: Optional[Path] = None, llm: Optional[LLMClient] = None,
-               rep_token: Optional[str] = None) -> FastAPI:
-    """App factory; tests inject a temporary database, a deterministic LLM and a rep key."""
+               rep_token: Optional[str] = None, secret_key: Optional[str] = None) -> FastAPI:
+    """App factory; tests inject a temporary database, a deterministic LLM, a rep key and
+    the token signing key."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -52,6 +54,10 @@ def create_app(db_path: Optional[Path] = None, llm: Optional[LLMClient] = None,
         agent = AdvisorAgent(config, store, llm or make_llm(config))
         app.state.config, app.state.tax_db, app.state.agent = config, tax_db, agent
         app.state.session_locks = SessionLocks()
+        # employee login: token signing key, demo access codes, wrong-code throttle
+        app.state.secret_key = load_secret(secret_key)
+        app.state.demo_access = DemoAccess()
+        app.state.login_throttle = LoginThrottle()
         # representative / admin endpoints: shared secret, fail closed when missing
         app.state.rep_token = rep_token or os.environ.get("REP_API_KEY", "").strip() or None
         if app.state.rep_token is None:

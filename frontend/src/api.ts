@@ -163,11 +163,71 @@ export interface Options {
   waiver: { allowed: boolean | null; reason: string; maintenance?: number };
 }
 
+export interface RankedOption {
+  rank: number;
+  kind: "car" | "waiver";
+  car_id: string | null;
+  label: string;
+  model_name: string;
+  group: string | null;
+  drive: string | null;
+  family_track: boolean;
+  is_electric: boolean;
+  company_monthly_cost: number | null;
+  value_of_use: number;
+  participation: number;
+  maintenance_allowance: number;
+  family_gap_deduction: number;
+  net_alt: number;
+  net_diff: number;
+  explanation: string;
+  is_selected: boolean;
+}
+
+/** All my options: every permitted alternative, best net first (engine only). */
+export interface Ranking {
+  ok: boolean;
+  missing_labels?: string[];
+  error?: string;
+  current_label?: string;
+  net_today?: number;
+  group?: string;
+  budget?: number;
+  count?: number;
+  best?: RankedOption | null;
+  best_electric?: RankedOption | null;
+  options?: RankedOption[];
+  notes?: string[];
+}
+
 export interface DemoEmployee {
   employee_id: string;
   name: string;
   occupation: string;
-  question: string;
+  /** demo accounts only (fictional people): the access code shown on the login screen */
+  demo_code: string | null;
+}
+
+export type LoginRequest = { emp_id: string; code: string } | { guest: true };
+
+export interface LoginResponse {
+  token: string;
+  token_type: "bearer";
+  expires_at: number;
+  session_id: string;
+  kind: "employee" | "guest";
+  employee_name: string | null;
+  bot_message: string;
+  state: StateView;
+}
+
+/** What the browser keeps after login (this tab only). */
+export interface Auth {
+  token: string;
+  session_id: string;
+  kind: "employee" | "guest";
+  employee_name: string | null;
+  expires_at: number;
 }
 
 export interface Catalog {
@@ -231,6 +291,45 @@ export function setRepKey(key: string | null) {
 
 const repHeaders = (): Record<string, string> => ({ "X-Rep-Token": getRepKey() ?? "" });
 
+// Employee login token (signed by the server, bound to one conversation). Kept for this
+// browser tab only: a refresh keeps the conversation, closing the tab logs out.
+const AUTH_STORAGE = "car-advisor.auth";
+/** fired when the server no longer accepts the token (expired, server key changed) */
+export const LOGOUT_EVENT = "car-advisor:logout";
+
+export function getAuth(): Auth | null {
+  try {
+    const raw = sessionStorage.getItem(AUTH_STORAGE);
+    if (!raw) return null;
+    const auth = JSON.parse(raw) as Auth;
+    if (!auth.token || !auth.session_id) return null;
+    if (auth.expires_at && auth.expires_at * 1000 < Date.now()) {
+      sessionStorage.removeItem(AUTH_STORAGE);
+      return null;
+    }
+    return auth;
+  } catch {
+    return null;
+  }
+}
+
+export function setAuth(auth: Auth | null) {
+  try {
+    if (auth) sessionStorage.setItem(AUTH_STORAGE, JSON.stringify(auth));
+    else sessionStorage.removeItem(AUTH_STORAGE);
+  } catch {
+    /* storage unavailable - the login lasts until the page is reloaded */
+  }
+}
+
+const authHeaders = (): Record<string, string> => {
+  const auth = getAuth();
+  return auth ? { Authorization: `Bearer ${auth.token}` } : {};
+};
+
+/** 401 on these paths is about another credential (rep key) or a failed login attempt */
+const NOT_EMPLOYEE_AUTH = /^\/api\/(rep|llm|auth)\//;
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -242,10 +341,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+      headers: { "Content-Type": "application/json", ...authHeaders(), ...(init?.headers ?? {}) },
     });
   } catch {
-    throw new ApiError(0, `השרת אינו זמין (${API_BASE}). האם ה-backend רץ?`);
+    throw new ApiError(
+      0,
+      import.meta.env.DEV
+        ? `השרת אינו זמין (${API_BASE}). האם ה-backend רץ?`
+        : "השרת אינו זמין כרגע. בדקו את החיבור לאינטרנט ונסו שוב בעוד רגע.",
+    );
   }
   if (!res.ok) {
     let detail = res.statusText;
@@ -254,6 +358,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
     } catch {
       /* non-JSON error body */
+    }
+    if (res.status === 401 && !NOT_EMPLOYEE_AUTH.test(path) && getAuth()) {
+      // the token is no longer valid: back to the login screen
+      setAuth(null);
+      window.dispatchEvent(new Event(LOGOUT_EVENT));
     }
     throw new ApiError(res.status, detail);
   }
@@ -279,13 +388,14 @@ const post = <T>(path: string, body?: unknown, headers?: Record<string, string>)
 
 export const api = {
   catalog: () => request<Catalog>("/api/catalog"),
-  /** sessionId null = first message: the server opens the conversation and returns its id */
-  chat: (message: string, sessionId: string | null) =>
-    post<ChatResponse>("/api/chat", sessionId ? { session_id: sessionId, message } : { message }),
+  /** employee number + code, or guest: a NEW conversation and a token bound to it */
+  login: (body: LoginRequest) => post<LoginResponse>("/api/auth/login", body),
+  /** a message in the logged-in conversation (the token says which one) */
+  chat: (message: string, sessionId: string) =>
+    post<ChatResponse>("/api/chat", { session_id: sessionId, message }),
   session: (id: string) => request<SessionResponse>(`/api/session/${id}`),
-  /** always a NEW conversation with a server-generated id */
-  loadDemo: (empId: string) => post<ChatResponse>(`/api/demo/${empId}`),
   options: (id: string) => request<Options>(`/api/session/${id}/options`),
+  ranking: (id: string) => request<Ranking>(`/api/session/${id}/ranking`),
   setAlternative: (id: string, choice: { car_id: string } | { waiver: true }) =>
     post<ChatResponse>(`/api/session/${id}/alternative`, choice),
   /** the PDF itself is the body; the server reads it in memory and keeps nothing */
@@ -296,9 +406,8 @@ export const api = {
       body: await readBytes(file), // raw bytes: portable across fetch implementations
       headers: { "Content-Type": "application/pdf" },
     }),
-  /** sessionId null = the payslip comes before any message: a new conversation is opened */
-  applyPayslip: (sessionId: string | null, values: PayslipValues) =>
-    post<ChatResponse>("/api/payslip/apply", sessionId ? { session_id: sessionId, values } : { values }),
+  applyPayslip: (sessionId: string, values: PayslipValues) =>
+    post<ChatResponse>("/api/payslip/apply", { session_id: sessionId, values }),
   tickets: () => request<Ticket[]>("/api/rep/tickets", { headers: repHeaders() }),
   answer: (id: string, answer_text: string, participation?: number) =>
     post<RepAnswerResponse>(`/api/rep/tickets/${id}/answer`, { answer_text, participation }, repHeaders()),

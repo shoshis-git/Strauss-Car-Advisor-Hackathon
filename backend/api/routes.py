@@ -16,9 +16,12 @@ from ..agent.payslip import PayslipError, PayslipUnreadable, extract_payslip, vi
 from ..agent.state import ConversationState
 from ..data_loader.config_loader import AppConfig
 from ..engine.eligibility import tax_value_of_use
+from .auth import (FORBIDDEN, Claims, LoginThrottle, ensure_owner, issue_token, require_claims,
+                   session_claims, verify_token)
 from .schemas import (CHAT_EXAMPLES, SESSION_ID_PATTERN, AlternativeBody, CarView, ChatRequest,
-                      ChatResponse, MessageView, PayslipApplyRequest, PayslipExtractResponse,
-                      RepAnswerRequest, RepAnswerResponse, SessionResponse, StateView, Ticket)
+                      ChatResponse, LoginRequest, LoginResponse, MessageView, PayslipApplyRequest,
+                      PayslipExtractResponse, RepAnswerRequest, RepAnswerResponse,
+                      SessionResponse, StateView, Ticket)
 
 SessionId = Path(..., pattern=SESSION_ID_PATTERN)
 
@@ -154,32 +157,84 @@ def catalog(request: Request) -> dict[str, Any]:
         } for c in cfg.cars],
         "occupations": [{"name": o.name, "eligibility_group": o.eligibility_group}
                         for o in cfg.occupations],
+        # demo accounts for the login screen - fictional people; their access code is
+        # published on purpose (judges log in with one click). Pilot: SSO instead.
         "demo_employees": [{"employee_id": e.employee_id, "name": e.name,
-                            "occupation": e.occupation, "question": e.question}
+                            "occupation": e.occupation,
+                            "demo_code": request.app.state.demo_access.code_for(e.employee_id)}
                            for e in cfg.employees],
     }
 
 
 # --------------------------------------------------------------------------- #
-# Employee screen
+# Login
+# --------------------------------------------------------------------------- #
+LOGIN_FAILED = "מספר עובד או קוד שגויים"
+LOGIN_LOCKED = "יותר מדי ניסיונות כניסה שגויים. נסו שוב בעוד כמה דקות."
+
+
+@router.post("/auth/login", response_model=LoginResponse)
+def login(body: LoginRequest, request: Request) -> LoginResponse:
+    """Employee: `emp_id` + `code` - a NEW conversation with the employee's record loaded
+    up front (occupation, group, pay, current car). Guest: `guest: true` - an empty
+    conversation. Returns a signed token bound to that conversation."""
+    agent, cfg = _agent(request), _config(request)
+    throttle: LoginThrottle = request.app.state.login_throttle
+    if body.guest:
+        state = agent.start_conversation()
+        greeting = GUEST_GREETING
+        state.add_message("assistant", greeting)
+        agent.store.save(state)
+        kind, emp_id, name = "guest", None, None
+    else:
+        emp_id = body.emp_id
+        if throttle.locked(emp_id):
+            raise HTTPException(429, LOGIN_LOCKED)
+        known = emp_id in {e.employee_id for e in cfg.employees}
+        # same answer for an unknown number and a wrong code: nothing to enumerate
+        if not (known and request.app.state.demo_access.check(emp_id, body.code)):
+            throttle.failed(emp_id)
+            raise HTTPException(401, LOGIN_FAILED)
+        throttle.succeeded(emp_id)
+        reply = agent.start_employee_session(emp_id)
+        state, greeting = reply.state, reply.text
+        kind, name = "employee", cfg.employee(emp_id).name
+    secret = request.app.state.secret_key
+    token = issue_token(secret, state.conversation_id, kind, emp_id)
+    return LoginResponse(token=token, expires_at=verify_token(secret, token).exp,
+                         session_id=state.conversation_id, kind=kind, employee_name=name,
+                         bot_message=greeting, state=StateView.of(state))
+
+
+GUEST_GREETING = ("שלום! אני יועץ הרכב. ספר/י לי על התפקיד, השכר והרכב שלך היום, ואחשב "
+                  "מה יקרה לנטו שלך אם תעבור/י לרכב אחר, לרכב חשמלי או תוותר/י על הרכב. "
+                  "אפשר גם להעלות תלוש שכר.")
+
+
+def _own_session(claims: Claims, body_session_id: Optional[str]) -> str:
+    """The conversation of the token; an explicit id in the body must be the same one."""
+    if body_session_id is not None:
+        ensure_owner(claims, body_session_id)
+    return claims.sid
+
+
+# --------------------------------------------------------------------------- #
+# Employee screen (every route: a signed token that owns the conversation)
 # --------------------------------------------------------------------------- #
 @router.post("/chat", response_model=ChatResponse)
 def chat(body: Annotated[ChatRequest, Body(openapi_examples=CHAT_EXAMPLES)],
-         request: Request) -> ChatResponse:
-    """First message: send `message` only - the server opens a conversation and returns
-    its `session_id`. Later messages: send that `session_id` too."""
+         request: Request, claims: Claims = Depends(require_claims)) -> ChatResponse:
+    """A message in the token's conversation (opened at login)."""
     agent = _agent(request)
-    if body.session_id is None:
-        session_id = agent.start_conversation().conversation_id
-    else:
-        session_id = body.session_id
-        _load(agent, session_id)  # 404 for an unknown session
+    session_id = _own_session(claims, body.session_id)
+    _load(agent, session_id)  # 404 if the conversation no longer exists
     with _locks(request)(session_id):
         reply = agent.handle_employee_message(session_id, body.message)
     return _chat_response(reply)
 
 
-@router.get("/session/{session_id}", response_model=SessionResponse)
+@router.get("/session/{session_id}", response_model=SessionResponse,
+            dependencies=[Depends(session_claims)])
 def get_session(request: Request, session_id: str = SessionId) -> SessionResponse:
     state = _load(_agent(request), session_id)
     messages = [MessageView(role=m.role, content=m.content, created_at=m.created_at)
@@ -189,28 +244,40 @@ def get_session(request: Request, session_id: str = SessionId) -> SessionRespons
 
 
 @router.post("/demo/{emp_id}", response_model=ChatResponse)
-def load_demo(request: Request, emp_id: str = Path(..., pattern=r"^E-\d{3}$")) -> ChatResponse:
-    """Open a NEW conversation (server-generated id) with a sample employee (E-001..E-006)
-    and compute their original question."""
+def load_demo(request: Request, emp_id: str = Path(..., pattern=r"^E-\d{3}$"),
+              claims: Claims = Depends(require_claims)) -> ChatResponse:
+    """Ask the sample employee's original question (from the challenge sheet) in the
+    token's conversation and compute it. Only the logged-in employee's own record."""
     agent, cfg = _agent(request), _config(request)
     try:
         cfg.employee(emp_id)
     except KeyError:
         raise HTTPException(404, f"demo employee {emp_id} not found") from None
-    session_id = agent.start_conversation().conversation_id
-    with _locks(request)(session_id):
-        reply = agent.load_demo_employee(session_id, emp_id)
+    if claims.kind != "employee" or claims.emp_id != emp_id:
+        raise HTTPException(403, FORBIDDEN)
+    _load(agent, claims.sid)
+    with _locks(request)(claims.sid):
+        reply = agent.load_demo_employee(claims.sid, emp_id)
     return _chat_response(reply)
 
 
-@router.get("/session/{session_id}/options")
+@router.get("/session/{session_id}/options", dependencies=[Depends(session_claims)])
 def session_options(request: Request, session_id: str = SessionId) -> dict[str, Any]:
     """Cars this employee may choose (own group or lower), family track and waiver."""
     from ..agent.tools import get_allowed_cars
     return get_allowed_cars(_load(_agent(request), session_id), _config(request))
 
 
-@router.post("/session/{session_id}/alternative", response_model=ChatResponse)
+@router.get("/session/{session_id}/ranking", dependencies=[Depends(session_claims)])
+def session_ranking(request: Request, session_id: str = SessionId) -> dict[str, Any]:
+    """All my options: net pay for every permitted alternative, best first (engine only,
+    no LLM; the conversation is not changed)."""
+    from ..agent.tools import rank_alternatives
+    return rank_alternatives(_load(_agent(request), session_id), _config(request))
+
+
+@router.post("/session/{session_id}/alternative", response_model=ChatResponse,
+             dependencies=[Depends(session_claims)])
 def set_alternative(body: AlternativeBody, request: Request,
                     session_id: str = SessionId) -> ChatResponse:
     """Quick switch: choose another car (or waiver) and recalculate immediately."""
@@ -235,7 +302,8 @@ _TOO_BIG = f"הקובץ גדול מדי (מעל {PAYSLIP_MAX_BYTES // (1024 * 10
 @router.post("/payslip/extract", response_model=PayslipExtractResponse, openapi_extra={
     "requestBody": {"required": True,
                     "content": {"application/pdf": {"schema": {"type": "string",
-                                                                "format": "binary"}}}}})
+                                                                "format": "binary"}}}}},
+    dependencies=[Depends(require_claims)])  # a paid model call: logged-in users only
 async def payslip_extract(request: Request, vision: bool = False) -> dict[str, Any]:
     """Body: the payslip PDF itself (Content-Type: application/pdf). The file is read in
     memory and discarded; identifying details are masked before the language model sees
@@ -268,15 +336,13 @@ async def payslip_extract(request: Request, vision: bool = False) -> dict[str, A
 
 
 @router.post("/payslip/apply", response_model=ChatResponse)
-def payslip_apply(body: PayslipApplyRequest, request: Request) -> ChatResponse:
-    """Save the values the employee confirmed (possibly corrected) and continue the chat.
-    Without session_id a new conversation is opened."""
+def payslip_apply(body: PayslipApplyRequest, request: Request,
+                  claims: Claims = Depends(require_claims)) -> ChatResponse:
+    """Save the values the employee confirmed (possibly corrected) and continue the chat
+    of the token's conversation."""
     agent = _agent(request)
-    if body.session_id is None:
-        session_id = agent.start_conversation().conversation_id
-    else:
-        session_id = body.session_id
-        _load(agent, session_id)
+    session_id = _own_session(claims, body.session_id)
+    _load(agent, session_id)
     with _locks(request)(session_id):
         try:
             reply = agent.apply_payslip(session_id, body.values.model_dump(exclude_none=True))
