@@ -113,6 +113,7 @@ export interface SessionResponse {
 
 export type PayslipFieldName =
   | "occupation"
+  | "eligibility_group"
   | "base_salary"
   | "commissions_bonuses"
   | "pension_pct"
