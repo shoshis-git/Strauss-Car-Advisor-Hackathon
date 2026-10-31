@@ -8,7 +8,6 @@ import {
   LOGOUT_EVENT,
   setAuth,
   type Auth,
-  type DemoEmployee,
 } from "./api";
 import { EmployeeScreen } from "./components/EmployeeScreen";
 import { LoginScreen } from "./components/LoginScreen";
@@ -35,7 +34,6 @@ function Logo() {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("employee");
-  const [demo, setDemo] = useState<DemoEmployee[]>([]);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [attempt, setAttempt] = useState(0); // bump to retry the connection
@@ -70,8 +68,7 @@ export default function App() {
       setBackendError(null);
       for (let i = 0; i < CONNECT_RETRIES; i++) {
         try {
-          const c = await api.catalog();
-          if (!cancelled) setDemo(c.demo_employees);
+          await api.catalog();
           break;
         } catch (e) {
           const waking = e instanceof ApiError && WAKING_STATUSES.includes(e.status);
@@ -195,9 +192,9 @@ export default function App() {
         {/* both screens stay mounted so switching tabs keeps the conversation */}
         <div hidden={tab !== "employee"}>
           {auth ? (
-            <EmployeeScreen key={auth.session_id} auth={auth} onLogout={logout} />
+            <EmployeeScreen key={auth.session_id} auth={auth} onLogout={logout} onSwitch={login} />
           ) : (
-            <LoginScreen demoEmployees={demo} onLogin={login} />
+            <LoginScreen onLogin={login} />
           )}
         </div>
         <div hidden={tab !== "rep"}>

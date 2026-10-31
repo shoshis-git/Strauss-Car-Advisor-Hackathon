@@ -2,10 +2,20 @@ import { useEffect, useState } from "react";
 import { api, type Auth, type Options, type Ranking } from "../api";
 import { useEmployeeSession } from "../useEmployeeSession";
 import { ChatPanel } from "./ChatPanel";
+import { ConversationMenu } from "./ConversationMenu";
 import { ComparisonDashboard } from "./ComparisonDashboard";
 import { PayslipReview } from "./PayslipReview";
 
-export function EmployeeScreen({ auth, onLogout }: { auth: Auth; onLogout: () => void }) {
+export function EmployeeScreen({
+  auth,
+  onLogout,
+  onSwitch,
+}: {
+  auth: Auth;
+  onLogout: () => void;
+  /** another conversation of the same employee (new or earlier): its token */
+  onSwitch: (auth: Auth) => void;
+}) {
   const s = useEmployeeSession(auth.session_id);
   const [options, setOptions] = useState<Options | null>(null);
   const group = s.state?.profile.eligibility_group ?? null;
@@ -99,6 +109,9 @@ export function EmployeeScreen({ auth, onLogout }: { auth: Auth; onLogout: () =>
                   יציאה
                 </button>
               </div>
+              {auth.kind === "employee" && (
+                <ConversationMenu currentId={auth.session_id} disabled={s.busy} onSwitch={onSwitch} />
+              )}
             </div>
           }
           review={

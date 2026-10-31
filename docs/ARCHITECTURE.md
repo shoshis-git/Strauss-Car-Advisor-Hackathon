@@ -134,7 +134,8 @@ sequenceDiagram
     participant S as שרת
     B->>S: POST /api/auth/login {emp_id, code} או {guest: true}
     S->>S: בדיקת הקוד (data/demo_access.json), הגבלת ניסיונות שגויים
-    S->>S: שיחה חדשה. לעובד מזוהה: טעינת הרשומה שלו מראש + ברכה אישית
+    S->>S: עובד מזוהה: השיחה האחרונה שלו, או שיחה חדשה עם הרשומה שלו + ברכה אישית. אורח: שיחה חדשה
+    Note over B,S: עובד מזוהה: POST /api/conversations (חדשה) או /api/conversations/{id}/open (קודמת שלו) מחזירים טוקן חדש לאותה שיחה
     S-->>B: טוקן חתום (HMAC-SHA256, SECRET_KEY): session_id, סוג כניסה, תפוגה
     B->>S: כל בקשה: Authorization: Bearer <token>
     S->>S: חתימה תקינה? לא פג תוקף? הטוקן שייך לשיחה המבוקשת?

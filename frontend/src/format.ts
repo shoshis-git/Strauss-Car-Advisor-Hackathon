@@ -42,3 +42,11 @@ export function timeOf(iso: string): string {
     ? ""
     : d.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
 }
+
+/** "14:05" today, "3.11 14:05" on another day */
+export function whenOf(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const today = d.toDateString() === new Date().toDateString();
+  return today ? timeOf(iso) : `${d.getDate()}.${d.getMonth() + 1} ${timeOf(iso)}`;
+}

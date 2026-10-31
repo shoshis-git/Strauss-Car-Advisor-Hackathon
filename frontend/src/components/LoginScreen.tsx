@@ -1,8 +1,7 @@
 import { useState, type FormEvent } from "react";
-import { api, ApiError, type Auth, type DemoEmployee, type LoginRequest } from "../api";
+import { api, ApiError, authOf, type Auth, type LoginRequest } from "../api";
 
 interface Props {
-  demoEmployees: DemoEmployee[];
   onLogin: (auth: Auth) => void;
 }
 
@@ -18,7 +17,7 @@ const inputClass =
   "placeholder:text-ink-300 focus:border-lilac-300 focus:outline-none focus:ring-4 focus:ring-lilac-100 disabled:opacity-60";
 
 /** The app's gate for employees: employee number + code, or continue as a guest. */
-export function LoginScreen({ demoEmployees, onLogin }: Props) {
+export function LoginScreen({ onLogin }: Props) {
   const [empId, setEmpId] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState<"employee" | "guest" | null>(null);
@@ -28,14 +27,7 @@ export function LoginScreen({ demoEmployees, onLogin }: Props) {
     setBusy(kind);
     setError(null);
     try {
-      const r = await api.login(body);
-      onLogin({
-        token: r.token,
-        session_id: r.session_id,
-        kind: r.kind,
-        employee_name: r.employee_name,
-        expires_at: r.expires_at,
-      });
+      onLogin(authOf(await api.login(body)));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
       setBusy(null);
@@ -53,18 +45,10 @@ export function LoginScreen({ demoEmployees, onLogin }: Props) {
     void doLogin({ emp_id: id, code: code.trim() }, "employee");
   };
 
-  /** judges: one click fills the form and logs in */
-  const demoLogin = (d: DemoEmployee) => {
-    if (!d.demo_code) return;
-    setEmpId(d.employee_id);
-    setCode(d.demo_code);
-    void doLogin({ emp_id: d.employee_id, code: d.demo_code }, "employee");
-  };
-
   const locked = busy !== null;
 
   return (
-    <div className="mx-auto grid max-w-5xl grid-cols-1 items-start gap-6 py-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+    <div className="mx-auto grid max-w-6xl grid-cols-1 items-stretch gap-6 py-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
       {/* RTL: the form is on the right */}
       <section
         className="rounded-[2rem] bg-white/80 p-7 shadow-[0_16px_40px_-18px_rgb(110_86_180/0.35)] ring-1 ring-white"
@@ -135,44 +119,53 @@ export function LoginScreen({ demoEmployees, onLogin }: Props) {
         </form>
       </section>
 
-      {demoEmployees.length > 0 && (
-        <section
-          className="rounded-[2rem] bg-linear-to-br from-peach-100 via-butter-50 to-blush-50 p-6 ring-1 ring-white"
-          aria-labelledby="demo-title"
-        >
-          <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h3 id="demo-title" className="font-display text-xl font-semibold text-ink-900">
-              חשבונות דמו להדגמה
-            </h3>
-            <span className="chip bg-white/80 text-ink-600">לחיצה = כניסה מיידית</span>
-          </div>
-          <p className="mt-1 text-xs text-ink-500">
-            עובדים פיקטיביים מנתוני האתגר. הקוד של כולם הוא{" "}
-            <span className="num font-semibold text-ink-700">{demoEmployees[0].demo_code}</span>.
+      {/* welcome panel: fills the middle of the page */}
+      <section
+        className="relative flex flex-col items-center overflow-hidden rounded-[2.5rem] bg-linear-to-br from-lilac-100 via-blush-50 to-peach-100 px-6 py-10 text-center ring-1 ring-white sm:px-10 lg:min-h-[34rem] lg:justify-center"
+        aria-labelledby="welcome-title"
+      >
+        <span aria-hidden="true" className="pointer-events-none absolute -top-16 -left-16 h-56 w-56 rounded-full bg-lilac-200/60 blur-3xl" />
+        <span aria-hidden="true" className="pointer-events-none absolute -right-20 -bottom-20 h-64 w-64 rounded-full bg-peach-200/70 blur-3xl" />
+        <span aria-hidden="true" className="pointer-events-none absolute top-1/3 right-10 h-32 w-32 rounded-full bg-mint-100/80 blur-2xl" />
+
+        <div className="relative flex flex-col items-center">
+          <span className="flex h-24 w-24 items-center justify-center rounded-[2rem] bg-white/80 text-ink-900 shadow-[0_18px_40px_-16px_rgb(110_86_180/0.45)] ring-1 ring-white">
+            <svg viewBox="0 0 24 24" className="h-12 w-12 text-lilac-600" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+              <path d="M5 16V11.5L7 7h10l2 4.5V16" strokeLinejoin="round" />
+              <path d="M3.5 16h17" strokeLinecap="round" />
+              <circle cx="7.5" cy="16.5" r="1.6" fill="currentColor" stroke="none" />
+              <circle cx="16.5" cy="16.5" r="1.6" fill="currentColor" stroke="none" />
+            </svg>
+          </span>
+
+          <span className="chip mt-6 bg-white/80 text-lilac-700">ברוכים הבאים</span>
+          <h2 id="welcome-title" className="mt-3 font-display text-4xl leading-tight font-semibold text-ink-900 sm:text-5xl">
+            הרכב הבא שלך,
+            <span className="block bg-linear-to-l from-lilac-600 via-blush-500 to-peach-300 bg-clip-text text-transparent">
+              במספרים ברורים
+            </span>
+          </h2>
+          <p className="mt-4 max-w-md text-base leading-relaxed text-ink-600">
+            יועץ הרכב מראה לך אילו רכבים מותרים לך, וכמה יישאר לך נטו בכל אחד מהם - לפני שמחליטים.
           </p>
-          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {demoEmployees.map((d) => (
-              <button
-                key={d.employee_id}
-                type="button"
-                disabled={locked || !d.demo_code}
-                onClick={() => demoLogin(d)}
-                aria-label={`כניסה כ${d.name} (${d.employee_id})`}
-                className="rounded-2xl bg-white/85 px-4 py-3 text-start shadow-sm ring-1 ring-white transition hover:-translate-y-0.5 hover:bg-white hover:shadow-md disabled:opacity-50 disabled:hover:translate-y-0"
-              >
-                <span className="flex items-baseline justify-between gap-2">
-                  <span className="font-display font-semibold text-ink-900">{d.name}</span>
-                  <span className="num text-[11px] text-ink-400">{d.employee_id}</span>
+
+          <ul className="mt-8 grid w-full max-w-xl grid-cols-1 gap-3 text-start sm:grid-cols-3">
+            {[
+              { icon: "🚗", title: "רק מה שמותר לך", text: "רכבים לפי קבוצת הזכאות שלך" },
+              { icon: "💰", title: "נטו בשקל", text: "השוואה מול הרכב של היום" },
+              { icon: "📄", title: "תלוש שכר", text: "העלאה במקום הקלדה" },
+            ].map((f) => (
+              <li key={f.title} className="rounded-2xl bg-white/75 p-4 shadow-sm ring-1 ring-white backdrop-blur">
+                <span className="text-2xl" aria-hidden="true">
+                  {f.icon}
                 </span>
-                <span className="mt-0.5 block text-xs text-ink-500">{d.occupation}</span>
-              </button>
+                <span className="mt-2 block font-display font-semibold text-ink-900">{f.title}</span>
+                <span className="mt-0.5 block text-xs text-ink-500">{f.text}</span>
+              </li>
             ))}
-          </div>
-          <p className="mt-4 text-[11px] leading-relaxed text-ink-500">
-            בפיילוט הכניסה תהיה עם המשתמש הארגוני של שטראוס (SSO), והנתונים ייטענו ממערכת השכר.
-          </p>
-        </section>
-      )}
+          </ul>
+        </div>
+      </section>
     </div>
   );
 }

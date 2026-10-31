@@ -235,6 +235,23 @@ export interface Auth {
   expires_at: number;
 }
 
+export const authOf = (r: LoginResponse): Auth => ({
+  token: r.token,
+  session_id: r.session_id,
+  kind: r.kind,
+  employee_name: r.employee_name,
+  expires_at: r.expires_at,
+});
+
+/** A row in "my conversations" (logged-in employees only). */
+export interface ConversationSummary {
+  session_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  waiting_for_rep: boolean;
+}
+
 export interface Catalog {
   demo_employees: DemoEmployee[];
   cars: CarSummary[];
@@ -393,8 +410,15 @@ const post = <T>(path: string, body?: unknown, headers?: Record<string, string>)
 
 export const api = {
   catalog: () => request<Catalog>("/api/catalog"),
-  /** employee number + code, or guest: a NEW conversation and a token bound to it */
+  /** employee number + code: back to the most recent conversation (or a new one);
+   *  guest: a NEW conversation. Either way a token bound to that conversation */
   login: (body: LoginRequest) => post<LoginResponse>("/api/auth/login", body),
+  /** my conversations, most recent first (employees only) */
+  conversations: () => request<ConversationSummary[]>("/api/conversations"),
+  /** a new conversation; the earlier ones are kept. A token bound to the new one */
+  newConversation: () => post<LoginResponse>("/api/conversations"),
+  /** back to one of my earlier conversations: a token bound to it */
+  openConversation: (id: string) => post<LoginResponse>(`/api/conversations/${id}/open`),
   /** a message in the logged-in conversation (the token says which one) */
   chat: (message: string, sessionId: string) =>
     post<ChatResponse>("/api/chat", { session_id: sessionId, message }),

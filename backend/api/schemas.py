@@ -77,6 +77,15 @@ class LoginResponse(BaseModel):
     state: "StateView"
 
 
+class ConversationSummary(BaseModel):
+    """A row in "my conversations" (logged-in employees only)."""
+    session_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    waiting_for_rep: bool
+
+
 # --- employee ---------------------------------------------------------------- #
 class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(
