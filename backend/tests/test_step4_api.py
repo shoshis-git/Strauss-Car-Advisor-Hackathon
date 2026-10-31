@@ -181,8 +181,8 @@ def test_employee_login_preloads_the_record_and_greets_personally(client):
     # the greeting is part of the conversation (also after a refresh)
     msgs = session(client, s)["messages"]
     assert [m["role"] for m in msgs] == ["assistant"] and msgs[0]["content"] == j["bot_message"]
-    # every login opens a new conversation
-    assert login(client, "E-001").sid != s.sid
+    # the next login returns to the same (most recent) conversation
+    assert login(client, "E-001").sid == s.sid
 
 
 def test_employee_login_then_only_the_alternative_is_asked(client):
@@ -242,6 +242,100 @@ def test_login_is_locked_after_repeated_wrong_codes(client):
     # other employee numbers are not affected
     assert client.post("/api/auth/login",
                        json={"emp_id": "E-001", "code": DEMO_CODE}).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# My conversations
+# --------------------------------------------------------------------------- #
+def conversations(client, s: Session) -> list[dict]:
+    r = client.get("/api/conversations", headers=s.headers)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def new_conversation(client, s: Session) -> Session:
+    r = client.post("/api/conversations", headers=s.headers)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    return Session(j["session_id"], bearer(j["token"]), j)
+
+
+def test_new_conversation_keeps_the_earlier_ones(client):
+    first = login(client, "E-001")
+    chat(client, first, "אני רוצה לעבור לאטו 3")
+    second = new_conversation(client, first)
+    assert second.sid != first.sid
+    j = second.login
+    assert j["kind"] == "employee" and j["employee_name"] == "נועה לוי"
+    # the new conversation also starts with the employee's record
+    assert j["state"]["missing_info"] == ["target_action"] and "נועה" in j["bot_message"]
+    # the new token is bound to the new conversation only
+    assert client.get(f"/api/session/{first.sid}", headers=second.headers).status_code == 403
+    rows = conversations(client, second)
+    assert [c["session_id"] for c in rows] == [second.sid, first.sid]  # newest first
+    assert [c["title"] for c in rows] == ["שיחה חדשה", "מעבר ל-ATTO 3"]
+    assert set(rows[0]) == {"session_id", "title", "created_at", "updated_at", "waiting_for_rep"}
+
+
+def test_open_an_earlier_conversation(client):
+    first = login(client, "E-001")
+    chat(client, first, "אני רוצה לעבור לאטו 3")
+    second = new_conversation(client, first)
+    r = client.post(f"/api/conversations/{first.sid}/open", headers=second.headers)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["session_id"] == first.sid and "+661" in j["bot_message"]
+    reopened = bearer(j["token"])
+    msgs = client.get(f"/api/session/{first.sid}", headers=reopened).json()["messages"]
+    assert [m["role"] for m in msgs] == ["assistant", "employee", "assistant"]
+
+
+def test_login_returns_to_the_most_recent_conversation(client):
+    first = login(client, "E-001")
+    second = new_conversation(client, first)
+    chat(client, second, "אני רוצה לעבור לאטו 3")
+    # opening an older conversation does not change which one is the most recent
+    client.post(f"/api/conversations/{first.sid}/open", headers=second.headers)
+    again = login(client, "E-001")
+    assert again.sid == second.sid and "+661" in again.login["bot_message"]
+    assert again.login["state"]["last_comparison"]["net_diff"] == 661
+
+
+def test_another_employees_conversations_are_not_listed_or_opened(client):
+    noa = login(client, "E-001")
+    david = login(client, "E-002")
+    assert [c["session_id"] for c in conversations(client, david)] == [david.sid]
+    r = client.post(f"/api/conversations/{noa.sid}/open", headers=david.headers)
+    assert r.status_code == 404
+    g = guest(client)
+    assert client.post(f"/api/conversations/{g.sid}/open",
+                       headers=david.headers).status_code == 404
+
+
+@pytest.mark.parametrize("method,path", [
+    ("get", "/api/conversations"),
+    ("post", "/api/conversations"),
+    ("post", f"/api/conversations/{UNKNOWN_SID}/open"),
+])
+def test_conversations_are_for_logged_in_employees_only(client, method, path):
+    assert getattr(client, method)(path).status_code == 401
+    r = getattr(client, method)(path, headers=guest(client).headers)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "רק עובד שנכנס עם מספר עובד וקוד יכול לשמור כמה שיחות"
+
+
+def test_conversations_of_an_older_database_are_kept(db_path):
+    """A database from before conversations had an owner gets the column on startup."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE conversations (conversation_id TEXT PRIMARY KEY, "
+                 "state_json TEXT NOT NULL, waiting_for_rep INTEGER NOT NULL, "
+                 "updated_at TEXT NOT NULL)")
+    conn.commit()
+    conn.close()
+    with TestClient(make_app(db_path)) as c:
+        s = login(c, "E-001")
+        assert [r["session_id"] for r in conversations(c, s)] == [s.sid]
 
 
 # --------------------------------------------------------------------------- #

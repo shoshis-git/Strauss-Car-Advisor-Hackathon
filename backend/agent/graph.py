@@ -173,7 +173,7 @@ class AdvisorAgent:
         so the advisor opens personally and only the requested alternative is still asked.
         Deterministic greeting (no LLM call)."""
         emp = self.config.employee(employee_id)  # KeyError if unknown
-        state = ConversationState()
+        state = ConversationState(owner_emp_id=emp.employee_id)
         self._fill_from_employee(state, emp)
         p, cur = state.profile, state.current
         if cur.status == "car":

@@ -19,7 +19,7 @@ from ..engine.eligibility import tax_value_of_use
 from .auth import (FORBIDDEN, Claims, LoginThrottle, ensure_owner, issue_token, require_claims,
                    session_claims, verify_token)
 from .schemas import (CHAT_EXAMPLES, SESSION_ID_PATTERN, AlternativeBody, CarView, ChatRequest,
-                      ChatResponse, LoginRequest, LoginResponse, MessageView, PayslipApplyRequest,
+                      ChatResponse, ConversationSummary, LoginRequest, LoginResponse, MessageView, PayslipApplyRequest,
                       PayslipExtractResponse, RepAnswerRequest, RepAnswerResponse,
                       SessionResponse, StateView, Ticket)
 
@@ -173,11 +173,27 @@ LOGIN_FAILED = "מספר עובד או קוד שגויים"
 LOGIN_LOCKED = "יותר מדי ניסיונות כניסה שגויים. נסו שוב בעוד כמה דקות."
 
 
+def _last_assistant_message(state: ConversationState) -> str:
+    return next((m.content for m in reversed(state.messages) if m.role == "assistant"), "")
+
+
+def _token_response(request: Request, state: ConversationState, kind: str,
+                    emp_id: Optional[str], bot_message: str) -> LoginResponse:
+    """A signed token bound to this conversation, and what the screen needs to show it."""
+    secret = request.app.state.secret_key
+    name = _config(request).employee(emp_id).name if emp_id else None
+    token = issue_token(secret, state.conversation_id, kind, emp_id)
+    return LoginResponse(token=token, expires_at=verify_token(secret, token).exp,
+                         session_id=state.conversation_id, kind=kind, employee_name=name,
+                         bot_message=bot_message, state=StateView.of(state))
+
+
 @router.post("/auth/login", response_model=LoginResponse)
 def login(body: LoginRequest, request: Request) -> LoginResponse:
-    """Employee: `emp_id` + `code` - a NEW conversation with the employee's record loaded
-    up front (occupation, group, pay, current car). Guest: `guest: true` - an empty
-    conversation. Returns a signed token bound to that conversation."""
+    """Employee: `emp_id` + `code` - back to their most recent conversation, or a new one
+    with the employee's record loaded up front (occupation, group, pay, current car).
+    Guest: `guest: true` - an empty conversation. Returns a signed token bound to that
+    conversation."""
     agent, cfg = _agent(request), _config(request)
     throttle: LoginThrottle = request.app.state.login_throttle
     if body.guest:
@@ -185,7 +201,7 @@ def login(body: LoginRequest, request: Request) -> LoginResponse:
         greeting = GUEST_GREETING
         state.add_message("assistant", greeting)
         agent.store.save(state)
-        kind, emp_id, name = "guest", None, None
+        kind, emp_id = "guest", None
     else:
         emp_id = body.emp_id
         if throttle.locked(emp_id):
@@ -196,19 +212,83 @@ def login(body: LoginRequest, request: Request) -> LoginResponse:
             throttle.failed(emp_id)
             raise HTTPException(401, LOGIN_FAILED)
         throttle.succeeded(emp_id)
-        reply = agent.start_employee_session(emp_id)
-        state, greeting = reply.state, reply.text
-        kind, name = "employee", cfg.employee(emp_id).name
-    secret = request.app.state.secret_key
-    token = issue_token(secret, state.conversation_id, kind, emp_id)
-    return LoginResponse(token=token, expires_at=verify_token(secret, token).exp,
-                         session_id=state.conversation_id, kind=kind, employee_name=name,
-                         bot_message=greeting, state=StateView.of(state))
+        latest = agent.store.list_for_employee(emp_id, limit=1)
+        if latest:
+            state = latest[0]
+            greeting = _last_assistant_message(state)
+        else:
+            reply = agent.start_employee_session(emp_id)
+            state, greeting = reply.state, reply.text
+        kind = "employee"
+    return _token_response(request, state, kind, emp_id, greeting)
 
 
 GUEST_GREETING = ("שלום! אני יועץ הרכב. ספר/י לי על התפקיד, השכר והרכב שלך היום, ואחשב "
                   "מה יקרה לנטו שלך אם תעבור/י לרכב אחר, לרכב חשמלי או תוותר/י על הרכב. "
                   "אפשר גם להעלות תלוש שכר.")
+
+
+# --------------------------------------------------------------------------- #
+# My conversations (employees who logged in with a number and a code)
+# --------------------------------------------------------------------------- #
+EMPLOYEES_ONLY = "רק עובד שנכנס עם מספר עובד וקוד יכול לשמור כמה שיחות"
+_TITLE_LEN = 40
+
+
+def _employee_claims(claims: Claims = Depends(require_claims)) -> Claims:
+    if claims.kind != "employee" or not claims.emp_id:
+        raise HTTPException(403, EMPLOYEES_ONLY)
+    return claims
+
+
+def _conversation_title(state: ConversationState, cfg: AppConfig) -> str:
+    """The requested alternative; otherwise the start of the employee's first message."""
+    tgt = state.target
+    if tgt.target_action == "waiver":
+        return "ויתור על הרכב"
+    if tgt.target_action == "replace" and tgt.target_car_code:
+        try:
+            return f"מעבר ל-{cfg.car(tgt.target_car_code).model_name}"
+        except KeyError:
+            pass
+    first = next((m.content.strip() for m in state.messages if m.role == "employee"), "")
+    if not first:
+        return "שיחה חדשה"
+    return first if len(first) <= _TITLE_LEN else first[:_TITLE_LEN].rstrip() + "…"
+
+
+@router.get("/conversations", response_model=list[ConversationSummary])
+def my_conversations(request: Request,
+                     claims: Claims = Depends(_employee_claims)) -> list[ConversationSummary]:
+    """The logged-in employee's conversations, most recent first."""
+    cfg = _config(request)
+    return [ConversationSummary(session_id=s.conversation_id,
+                                title=_conversation_title(s, cfg),
+                                created_at=s.created_at, updated_at=s.updated_at,
+                                waiting_for_rep=s.waiting_for_rep)
+            for s in _agent(request).store.list_for_employee(claims.emp_id)]
+
+
+@router.post("/conversations", response_model=LoginResponse)
+def new_conversation(request: Request,
+                     claims: Claims = Depends(_employee_claims)) -> LoginResponse:
+    """A new conversation with the employee's record loaded; the earlier ones are kept.
+    Returns a token bound to the new conversation."""
+    reply = _agent(request).start_employee_session(claims.emp_id)
+    return _token_response(request, reply.state, "employee", claims.emp_id, reply.text)
+
+
+@router.post("/conversations/{session_id}/open", response_model=LoginResponse)
+def open_conversation(request: Request, session_id: str = SessionId,
+                      claims: Claims = Depends(_employee_claims)) -> LoginResponse:
+    """Back to one of my earlier conversations: a token bound to it."""
+    state = _load(_agent(request), session_id)
+    # another employee's conversation (or a guest one) looks the same as a missing one
+    if state.owner_emp_id is None or not hmac.compare_digest(state.owner_emp_id,
+                                                             claims.emp_id):
+        raise HTTPException(404, "session not found")
+    return _token_response(request, state, "employee", claims.emp_id,
+                           _last_assistant_message(state))
 
 
 def _own_session(claims: Claims, body_session_id: Optional[str]) -> str:

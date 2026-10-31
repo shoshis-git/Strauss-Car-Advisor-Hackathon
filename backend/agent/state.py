@@ -58,6 +58,8 @@ class Message(BaseModel):
 class ConversationState(BaseModel):
     conversation_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     display_name: Optional[str] = None  # shown to the representative (e.g. demo employee)
+    # the logged-in employee who opened it (None = guest): only they may list / reopen it
+    owner_emp_id: Optional[str] = None
     profile: EmployeeProfile = Field(default_factory=EmployeeProfile)
     current: CurrentSituation = Field(default_factory=CurrentSituation)
     target: TargetChoice = Field(default_factory=TargetChoice)
@@ -214,18 +216,32 @@ def next_phase_fields(missing: list[str]) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Persistence
 # --------------------------------------------------------------------------- #
+MAX_LISTED = 50  # conversations shown in "my conversations"
+
+
 class StateStore:
     """Conversations persisted as JSON documents in SQLite (app_data.db by default)."""
 
     def __init__(self, db_path: Path = paths.APP_DB):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS conversations ("
-                "conversation_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, "
-                "waiting_for_rep INTEGER NOT NULL, updated_at TEXT NOT NULL)"
-            )
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS conversations ("
+                    "conversation_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, "
+                    "waiting_for_rep INTEGER NOT NULL, updated_at TEXT NOT NULL, "
+                    "owner_emp_id TEXT)"
+                )
+                # databases created before conversations had an owner
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}
+                if "owner_emp_id" not in cols:
+                    conn.execute("ALTER TABLE conversations ADD COLUMN owner_emp_id TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS conversations_owner "
+                             "ON conversations (owner_emp_id, updated_at)")
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -236,12 +252,26 @@ class StateStore:
         try:
             with conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO conversations VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO conversations (conversation_id, state_json, "
+                    "waiting_for_rep, updated_at, owner_emp_id) VALUES (?, ?, ?, ?, ?)",
                     (state.conversation_id, state.model_dump_json(),
-                     int(state.waiting_for_rep), state.updated_at),
+                     int(state.waiting_for_rep), state.updated_at, state.owner_emp_id),
                 )
         finally:
             conn.close()
+
+    def list_for_employee(self, emp_id: str,
+                          limit: int = MAX_LISTED) -> list[ConversationState]:
+        """The employee's conversations, most recently updated first."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT state_json FROM conversations WHERE owner_emp_id=? "
+                "ORDER BY updated_at DESC LIMIT ?", (emp_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [ConversationState.model_validate(json.loads(r[0])) for r in rows]
 
     def load(self, conversation_id: str) -> ConversationState:
         conn = self._connect()
@@ -284,8 +314,13 @@ class PostgresStateStore:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS conversations ("
                 "conversation_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, "
-                "waiting_for_rep BOOLEAN NOT NULL, updated_at TEXT NOT NULL)"
+                "waiting_for_rep BOOLEAN NOT NULL, updated_at TEXT NOT NULL, "
+                "owner_emp_id TEXT)"
             )
+            # databases created before conversations had an owner
+            conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS owner_emp_id TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS conversations_owner "
+                         "ON conversations (owner_emp_id, updated_at)")
             # salary data: no access through Supabase's public REST API (no policies).
             # The table owner (this connection) is not affected by RLS.
             conn.execute("ALTER TABLE conversations ENABLE ROW LEVEL SECURITY")
@@ -297,12 +332,24 @@ class PostgresStateStore:
         state.updated_at = _now()
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO conversations VALUES (%s, %s, %s, %s) "
+                "INSERT INTO conversations (conversation_id, state_json, waiting_for_rep, "
+                "updated_at, owner_emp_id) VALUES (%s, %s, %s, %s, %s) "
                 "ON CONFLICT (conversation_id) DO UPDATE SET state_json=EXCLUDED.state_json, "
-                "waiting_for_rep=EXCLUDED.waiting_for_rep, updated_at=EXCLUDED.updated_at",
+                "waiting_for_rep=EXCLUDED.waiting_for_rep, updated_at=EXCLUDED.updated_at, "
+                "owner_emp_id=EXCLUDED.owner_emp_id",
                 (state.conversation_id, state.model_dump_json(),
-                 state.waiting_for_rep, state.updated_at),
+                 state.waiting_for_rep, state.updated_at, state.owner_emp_id),
             )
+
+    def list_for_employee(self, emp_id: str,
+                          limit: int = MAX_LISTED) -> list[ConversationState]:
+        """The employee's conversations, most recently updated first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT state_json FROM conversations WHERE owner_emp_id=%s "
+                "ORDER BY updated_at DESC LIMIT %s", (emp_id, limit),
+            ).fetchall()
+        return [ConversationState.model_validate(json.loads(r[0])) for r in rows]
 
     def load(self, conversation_id: str) -> ConversationState:
         with self._connect() as conn:

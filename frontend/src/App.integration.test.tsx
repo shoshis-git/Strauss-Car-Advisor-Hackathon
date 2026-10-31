@@ -40,6 +40,20 @@ async function loginAsGuest(): Promise<HTMLElement> {
   return box;
 }
 
+const authSid = () => (JSON.parse(sessionStorage.getItem("car-advisor.auth") ?? "{}") as { session_id?: string }).session_id;
+
+/** Log in through the form as sample employee E-001 (נועה לוי). The login returns to her
+ *  most recent conversation (left by an earlier test), so start a fresh one. */
+async function loginAsNoa(): Promise<void> {
+  fireEvent.change(await screen.findByLabelText("מספר עובד", {}, T), { target: { value: "E-001" } });
+  fireEvent.change(screen.getByLabelText("קוד"), { target: { value: "1234" } });
+  fireEvent.click(screen.getByRole("button", { name: "כניסה עם מספר עובד" }));
+  await waitFor(() => expect(authSid()).toBeTruthy(), T);
+  const resumed = authSid();
+  fireEvent.click(await screen.findByRole("button", { name: "+ שיחה חדשה" }, T));
+  await waitFor(() => expect(authSid()).not.toBe(resumed), T);
+}
+
 describe.skipIf(!health)("App ↔ backend", () => {
   it("the rep tickets are closed without the rep key", async () => {
     expect((await fetch(`${API_BASE}/api/rep/tickets`)).status).toBe(401);
@@ -75,7 +89,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
 
   it("demo login E-001 preloads the record; all my options appear only after an answer", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    await loginAsNoa();
     // personal greeting from the preloaded record
     await screen.findByText(/שלום נועה!/, {}, T);
     expect(sessionStorage.getItem("car-advisor.auth")).toContain("token");
@@ -104,7 +118,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
     "after asking in the chat, the ranked options appear by themselves",
     async () => {
       render(<App />);
-      fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+      await loginAsNoa();
       const box = await screen.findByLabelText("הודעה ליועץ", {}, T);
       await screen.findByText(/שלום נועה!/, {}, T);
       fireEvent.change(box, { target: { value: "אני רוצה לעבור לאטו 3" } });
@@ -119,7 +133,7 @@ describe.skipIf(!health)("App ↔ backend", () => {
 
   it("the login survives a refresh, and logout returns to the login screen", async () => {
     const first = render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    await loginAsNoa();
     await screen.findByText(/שלום נועה!/, {}, T);
     first.unmount(); // "refresh": a new App reads the token from sessionStorage
     render(<App />);
@@ -129,9 +143,32 @@ describe.skipIf(!health)("App ↔ backend", () => {
     expect(sessionStorage.getItem("car-advisor.auth")).toBeNull();
   });
 
+  it.skipIf(!deterministic)("a new conversation keeps the earlier one, which can be reopened", async () => {
+    render(<App />);
+    await loginAsNoa();
+    const box = await screen.findByLabelText("הודעה ליועץ", {}, T);
+    await screen.findByText(/שלום נועה!/, {}, T);
+    fireEvent.change(box, { target: { value: "אני רוצה לעבור לאטו 3" } });
+    fireEvent.click(screen.getByRole("button", { name: "שליחה" }));
+    await screen.findByTestId("net-diff", {}, T);
+    const first = authSid();
+
+    fireEvent.click(screen.getByRole("button", { name: "+ שיחה חדשה" }));
+    await waitFor(() => expect(authSid()).not.toBe(first), T);
+    await screen.findByText(/שלום נועה!/, {}, T);
+    expect(screen.queryByTestId("net-diff")).toBeNull(); // a clean conversation
+
+    fireEvent.click(screen.getByRole("button", { name: /השיחות שלי/ }));
+    // newest first: earlier tests left older Atto 3 conversations further down
+    const [earlier] = await screen.findAllByRole("button", { name: /מעבר ל-ATTO 3/ }, T);
+    fireEvent.click(earlier);
+    await waitFor(() => expect(authSid()).toBe(first), T);
+    await screen.findByTestId("net-diff", {}, T); // its result is back
+  }, 30000);
+
   it("quick switch recalculates for another allowed car", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /כניסה כנועה לוי/ }, T));
+    await loginAsNoa();
     fireEvent.click(await screen.findByTestId("all-options-request", {}, T));
     fireEvent.click(await screen.findByRole("button", { name: /הצג את כל/ }, T));
     fireEvent.click(await screen.findByRole("button", { name: /^ATTO 3:/ }, T));
