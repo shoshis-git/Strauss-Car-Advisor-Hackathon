@@ -114,12 +114,12 @@ def _car_view(config: AppConfig, car_id: Optional[str]) -> Optional[CarView]:
 # --------------------------------------------------------------------------- #
 # Health / catalogue
 # --------------------------------------------------------------------------- #
-@router.get("/health")
+
+@router.api_route("/health", methods=["GET", "HEAD"])
 def health(request: Request) -> dict[str, Any]:
     from ..agent.rule_based import RuleBasedLLM
     return {"status": "ok", "rules_version": _config(request).rules.version,
             "deterministic": isinstance(_agent(request).llm, RuleBasedLLM)}
-
 
 @rep_router.get("/llm/check")
 def llm_check(request: Request) -> dict[str, Any]:
