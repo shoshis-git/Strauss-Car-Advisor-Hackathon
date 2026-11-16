@@ -1,14 +1,15 @@
 
 name: CI - Strauss Car Advisor
 
+
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
   pull_request:
     branches:
       - main
-
 permissions:
   contents: read
 
